@@ -109,7 +109,7 @@
     "@testing-library/user-event": "^13.1.2",
     "@types/classnames": "^2.2.10",
     "@types/clipboard": "^2.0.1",
-    "@types/d3": "^5.7.2",
+    "@types/d3": "^6.5.0",
     "@types/d3-graphviz": "^2.6.3",
     "@types/dom-mediacapture-record": "^1.0.7",
     "@types/dompurify": "^2.0.3",
