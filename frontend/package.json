@@ -54,7 +54,7 @@
     "decamelize": "^4.0.0",
     "deck.gl": "^8.2.5",
     "dompurify": "^2.2.8",
-    "emotion-theming": "^10.0.27",
+    "emotion-theming": "^11.0.0",
     "fzy.js": "^0.4.1",
     "hoist-non-react-statics": "^3.3.2",
     "humanize-string": "^2.1.0",
