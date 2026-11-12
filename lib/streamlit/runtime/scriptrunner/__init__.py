@@ -1,4 +1,4 @@
-# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022)
+# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,20 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Explicitly export public symbols
-from .script_runner import (
-    ScriptRunner as ScriptRunner,
-    ScriptRunnerEvent as ScriptRunnerEvent,
-    StopException as StopException,
-    RerunException as RerunException,
+from streamlit.runtime.scriptrunner.script_runner import ScriptRunner, ScriptRunnerEvent
+from streamlit.runtime.scriptrunner_utils.exceptions import (
+    RerunException,
+    StopException,
+)
+from streamlit.runtime.scriptrunner_utils.run_descriptor import RunDescriptor
+from streamlit.runtime.scriptrunner_utils.script_requests import RerunData
+from streamlit.runtime.scriptrunner_utils.script_run_context import (
+    ScriptRunContext,
+    add_script_run_ctx,
+    enqueue_message,
+    get_script_run_ctx,
 )
 
-from .script_run_context import (
-    ScriptRunContext as ScriptRunContext,
-    get_script_run_ctx as get_script_run_ctx,
-    add_script_run_ctx as add_script_run_ctx,
-)
-
-from .script_requests import (
-    RerunData as RerunData,
-)
+__all__ = [
+    "RerunData",
+    "RerunException",
+    "RunDescriptor",
+    "ScriptRunContext",
+    "ScriptRunner",
+    "ScriptRunnerEvent",
+    "StopException",
+    "add_script_run_ctx",
+    "enqueue_message",
+    "get_script_run_ctx",
+]

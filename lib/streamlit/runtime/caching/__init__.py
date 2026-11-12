@@ -1,4 +1,4 @@
-# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022)
+# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,28 +12,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import contextlib
-from typing import TYPE_CHECKING, Iterator
+from __future__ import annotations
 
-from google.protobuf.message import Message
+from typing import TYPE_CHECKING
 
-from streamlit.proto.Block_pb2 import Block
+from streamlit.runtime.caching.cache_data_api import (
+    CACHE_DATA_MESSAGE_REPLAY_CTX,
+    CacheDataAPI,
+    get_data_cache_stats_provider,
+)
+from streamlit.runtime.caching.cache_data_api import (
+    clear_session_cache as clear_session_data_cache,
+)
+from streamlit.runtime.caching.cache_errors import CACHE_DOCS_URL
+from streamlit.runtime.caching.cache_resource_api import (
+    CACHE_RESOURCE_MESSAGE_REPLAY_CTX,
+    CacheResourceAPI,
+    get_resource_cache_stats_provider,
+)
+from streamlit.runtime.caching.cache_resource_api import (
+    clear_session_cache as clear_session_resource_cache,
+)
 
 if TYPE_CHECKING:
-    from streamlit.delta_generator import DeltaGenerator
+    from google.protobuf.message import Message
 
-from .memo_decorator import (
-    MEMO_CALL_STACK,
-    MEMO_MESSAGES_CALL_STACK,
-    _memo_caches,
-    MemoAPI,
-)
-from .singleton_decorator import (
-    SINGLETON_CALL_STACK,
-    SINGLETON_MESSAGE_CALL_STACK,
-    _singleton_caches,
-    SingletonAPI,
-)
+    from streamlit.elements.lib.layout_utils import LayoutConfig
+    from streamlit.proto.Block_pb2 import Block
 
 
 def save_element_message(
@@ -42,12 +47,30 @@ def save_element_message(
     invoked_dg_id: str,
     used_dg_id: str,
     returned_dg_id: str,
+    layout_config: LayoutConfig | None = None,
+    agent_props: str | None = None,
 ) -> None:
-    MEMO_MESSAGES_CALL_STACK.save_element_message(
-        delta_type, element_proto, invoked_dg_id, used_dg_id, returned_dg_id
+    """Save the message for an element to a thread-local callstack, so it can
+    be used later to replay the element when a cache-decorated function's
+    execution is skipped.
+    """
+    CACHE_DATA_MESSAGE_REPLAY_CTX.save_element_message(
+        delta_type,
+        element_proto,
+        invoked_dg_id,
+        used_dg_id,
+        returned_dg_id,
+        layout_config,
+        agent_props,
     )
-    SINGLETON_MESSAGE_CALL_STACK.save_element_message(
-        delta_type, element_proto, invoked_dg_id, used_dg_id, returned_dg_id
+    CACHE_RESOURCE_MESSAGE_REPLAY_CTX.save_element_message(
+        delta_type,
+        element_proto,
+        invoked_dg_id,
+        used_dg_id,
+        returned_dg_id,
+        layout_config,
+        agent_props,
     )
 
 
@@ -56,34 +79,39 @@ def save_block_message(
     invoked_dg_id: str,
     used_dg_id: str,
     returned_dg_id: str,
+    agent_props: str | None = None,
 ) -> None:
-    MEMO_MESSAGES_CALL_STACK.save_block_message(
-        block_proto, invoked_dg_id, used_dg_id, returned_dg_id
+    """Save the message for a block to a thread-local callstack, so it can
+    be used later to replay the block when a cache-decorated function's
+    execution is skipped.
+    """
+    CACHE_DATA_MESSAGE_REPLAY_CTX.save_block_message(
+        block_proto, invoked_dg_id, used_dg_id, returned_dg_id, agent_props
     )
-    SINGLETON_MESSAGE_CALL_STACK.save_block_message(
-        block_proto, invoked_dg_id, used_dg_id, returned_dg_id
+    CACHE_RESOURCE_MESSAGE_REPLAY_CTX.save_block_message(
+        block_proto, invoked_dg_id, used_dg_id, returned_dg_id, agent_props
     )
 
 
-def maybe_show_cached_st_function_warning(dg, st_func_name: str) -> None:
-    MEMO_CALL_STACK.maybe_show_cached_st_function_warning(dg, st_func_name)
-    SINGLETON_CALL_STACK.maybe_show_cached_st_function_warning(dg, st_func_name)
+def save_media_data(media_data: bytes | str, mimetype: str, media_id: str) -> None:
+    CACHE_DATA_MESSAGE_REPLAY_CTX.save_media_data(media_data, mimetype, media_id)
+    CACHE_RESOURCE_MESSAGE_REPLAY_CTX.save_media_data(media_data, mimetype, media_id)
 
-
-@contextlib.contextmanager
-def suppress_cached_st_function_warning() -> Iterator[None]:
-    with MEMO_CALL_STACK.suppress_cached_st_function_warning(), SINGLETON_CALL_STACK.suppress_cached_st_function_warning():
-        yield
-
-
-# Explicitly export public symbols
-from .memo_decorator import (
-    get_memo_stats_provider as get_memo_stats_provider,
-)
-from .singleton_decorator import (
-    get_singleton_stats_provider as get_singleton_stats_provider,
-)
 
 # Create and export public API singletons.
-memo = MemoAPI()
-singleton = SingletonAPI()
+cache_data = CacheDataAPI(decorator_metric_name="cache_data")
+cache_resource = CacheResourceAPI(decorator_metric_name="cache_resource")
+
+
+__all__ = [
+    "CACHE_DOCS_URL",
+    "cache_data",
+    "cache_resource",
+    "clear_session_data_cache",
+    "clear_session_resource_cache",
+    "get_data_cache_stats_provider",
+    "get_resource_cache_stats_provider",
+    "save_block_message",
+    "save_element_message",
+    "save_media_data",
+]

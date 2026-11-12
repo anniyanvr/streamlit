@@ -1,4 +1,4 @@
-# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022)
+# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,59 +13,93 @@
 # limitations under the License.
 
 """Utility functions to use in our tests."""
-import threading
-import unittest
-from contextlib import contextmanager
-from typing import Any, Dict, List
-from unittest.mock import patch, MagicMock
 
-import streamlit
+from __future__ import annotations
+
+import os
+import threading
+from contextlib import contextmanager
+from typing import TYPE_CHECKING
+
 from streamlit import config
-from streamlit.proto.Delta_pb2 import Delta
-from streamlit.proto.ForwardMsg_pb2 import ForwardMsg
-from streamlit.runtime import media_file_manager, Runtime
-from streamlit.runtime.app_session import AppSession
-from streamlit.runtime.forward_msg_queue import ForwardMsgQueue
-from streamlit.runtime.media_file_manager import MediaFileManager
-from streamlit.runtime.scriptrunner import (
-    add_script_run_ctx,
-    get_script_run_ctx,
-    ScriptRunContext,
+from streamlit.connections.retry_util import retry as _REAL_RETRY
+from streamlit.runtime.fragment import MemoryFragmentStorage
+from streamlit.runtime.memory_uploaded_file_manager import MemoryUploadedFileManager
+from streamlit.runtime.pages_manager import PagesManager
+from streamlit.runtime.scriptrunner import ScriptRunContext
+from streamlit.runtime.scriptrunner_utils.script_run_context import ThreadState
+from streamlit.runtime.scriptrunner_utils.script_run_context_attr import (
+    SCRIPT_RUN_CONTEXT_ATTR_NAME,
 )
 from streamlit.runtime.state import SafeSessionState, SessionState
-from streamlit.runtime.uploaded_file_manager import UploadedFileManager
-from streamlit.runtime.memory_media_file_storage import MemoryMediaFileStorage
-from streamlit.web.server.server import MEDIA_ENDPOINT
+
+# Reexport functions that were moved to main codebase
+from streamlit.testing.v1.util import (
+    build_mock_config_get_option as build_mock_config_get_option,  # noqa: PLC0414
+)
+from streamlit.testing.v1.util import (
+    patch_config_options as patch_config_options,  # noqa: PLC0414
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Generator
+
+    from snowflake.snowpark import Session
+
+
+def create_mock_script_run_ctx() -> ScriptRunContext:
+    """Create a ScriptRunContext for use in tests.
+
+    Also initializes FragmentThreadState on the current thread's ContextVar,
+    mirroring what reset() does in production. This ensures any code path that
+    calls ThreadState.get() will find an initialized binding.
+    """
+    ThreadState.initialize()
+    return ScriptRunContext(
+        session_id="mock_session_id",
+        _enqueue=lambda msg: None,
+        query_string="mock_query_string",
+        session_state=SafeSessionState(SessionState(), lambda: None),
+        uploaded_file_mgr=MemoryUploadedFileManager("/mock/upload"),
+        main_script_path="",
+        user_info={"email": "mock@example.com"},
+        fragment_storage=MemoryFragmentStorage(),
+        pages_manager=PagesManager(""),
+    )
+
+
+def retry_without_sleep(**kwargs: object) -> object:
+    """Call the original connection retry with a no-op sleep so unit tests stay fast.
+
+    The original ``retry`` is bound at import time. Tests patch
+    ``retry_util.retry`` with this helper, so a lazy import would resolve to
+    this function and recurse.
+    """
+    kwargs["sleep"] = lambda _seconds: None
+    return _REAL_RETRY(**kwargs)
 
 
 @contextmanager
-def patch_config_options(config_overrides: Dict[str, Any]):
-    """A context manager that overrides config options. It can
-    also be used as a function decorator.
+def script_run_ctx_and_cleared_cache() -> Generator[None, None, None]:
+    """Attach a mock ScriptRunContext and restore the previous one after the test.
 
-    Examples:
-    >>> with patch_config_options({"server.headless": True}):
-    ...     assert(config.get_option("server.headless") is True)
-    ...     # Other test code that relies on these options
-
-    >>> @patch_config_options({"server.headless": True})
-    ... def test_my_thing():
-    ...   assert(config.get_option("server.headless") is True)
+    Also clears ``st.cache_data`` so query-cache tests cannot leak across cases.
     """
-    mock_get_option = build_mock_config_get_option(config_overrides)
-    with patch.object(config, "get_option", new=mock_get_option):
+    import streamlit as st
+    from streamlit.runtime.scriptrunner import add_script_run_ctx
+
+    thread = threading.current_thread()
+    previous_ctx = getattr(thread, SCRIPT_RUN_CONTEXT_ATTR_NAME, None)
+    add_script_run_ctx(thread, create_mock_script_run_ctx())
+    try:
         yield
-
-
-def build_mock_config_get_option(overrides_dict):
-    orig_get_option = config.get_option
-
-    def mock_config_get_option(name):
-        if name in overrides_dict:
-            return overrides_dict[name]
-        return orig_get_option(name)
-
-    return mock_config_get_option
+    finally:
+        st.cache_data.clear()
+        if previous_ctx is None:
+            if hasattr(thread, SCRIPT_RUN_CONTEXT_ATTR_NAME):
+                delattr(thread, SCRIPT_RUN_CONTEXT_ATTR_NAME)
+        else:
+            setattr(thread, SCRIPT_RUN_CONTEXT_ATTR_NAME, previous_ctx)
 
 
 def build_mock_config_is_manually_set(overrides_dict):
@@ -77,70 +111,6 @@ def build_mock_config_is_manually_set(overrides_dict):
         return orig_is_manually_set(name)
 
     return mock_config_is_manually_set
-
-
-class FakeAppSession(AppSession):
-    def __init__(self):
-        self._session_state = SessionState()
-
-
-class DeltaGeneratorTestCase(unittest.TestCase):
-    def setUp(self, override_root=True):
-        self.forward_msg_queue = ForwardMsgQueue()
-        self.override_root = override_root
-        self.orig_report_ctx = None
-        self.new_script_run_ctx = ScriptRunContext(
-            session_id="test session id",
-            _enqueue=self.forward_msg_queue.enqueue,
-            query_string="",
-            session_state=SafeSessionState(SessionState()),
-            uploaded_file_mgr=UploadedFileManager(),
-            page_script_hash="",
-            user_info={"email": "test@test.com"},
-        )
-
-        if self.override_root:
-            self.orig_report_ctx = get_script_run_ctx()
-            add_script_run_ctx(threading.current_thread(), self.new_script_run_ctx)
-
-        self.app_session = FakeAppSession()
-
-        # Create a MemoryMediaFileStorage instance, and the MediaFileManager
-        # singleton.
-        self.media_file_storage = MemoryMediaFileStorage(MEDIA_ENDPOINT)
-
-        mock_runtime = MagicMock(spec=Runtime)
-        mock_runtime.media_file_mgr = MediaFileManager(self.media_file_storage)
-        Runtime._instance = mock_runtime
-
-        # Accessing the MediaFileManager requires that _is_running_with_streamlit
-        # is True.
-        streamlit._is_running_with_streamlit = True
-
-    def tearDown(self):
-        self.clear_queue()
-        if self.override_root:
-            add_script_run_ctx(threading.current_thread(), self.orig_report_ctx)
-        Runtime._instance = None
-        streamlit._is_running_with_streamlit = False
-
-    def get_message_from_queue(self, index=-1) -> ForwardMsg:
-        """Get a ForwardMsg proto from the queue, by index."""
-        return self.forward_msg_queue._queue[index]
-
-    def get_delta_from_queue(self, index=-1) -> Delta:
-        """Get a Delta proto from the queue, by index."""
-        deltas = self.get_all_deltas_from_queue()
-        return deltas[index]
-
-    def get_all_deltas_from_queue(self) -> List[Delta]:
-        """Return all the delta messages in our ForwardMsgQueue"""
-        return [
-            msg.delta for msg in self.forward_msg_queue._queue if msg.HasField("delta")
-        ]
-
-    def clear_queue(self) -> None:
-        self.forward_msg_queue.clear()
 
 
 def normalize_md(txt: str) -> str:
@@ -175,3 +145,84 @@ def normalize_md(txt: str) -> str:
     txt = txt.replace("OMG_LINK", "](")
 
     return txt.strip()
+
+
+@contextmanager
+def create_snowpark_session() -> Session:
+    from snowflake.snowpark import Session
+
+    session = Session.builder.configs(
+        {
+            "account": os.environ.get("SNOWFLAKE_ACCOUNT"),
+            "user": "test_streamlit",
+            "password": os.environ.get("SNOWFLAKE_PASSWORD"),
+            "role": "testrole_streamlit",
+            "warehouse": "testwh_streamlit",
+            "database": "testdb_streamlit",
+            "schema": "testschema_streamlit",
+        }
+    ).create()
+    try:
+        yield session
+    finally:
+        session.close()
+
+
+def create_pep649_function(
+    base_func: object, string_annotations: dict[str, str]
+) -> object:
+    """Create a function with PEP 649-style annotations that raise NameError.
+
+    This helper creates a function with a custom __annotate__ that simulates
+    PEP 649 deferred annotation behavior: raises NameError when annotations
+    are evaluated in VALUE format (like types imported under TYPE_CHECKING).
+
+    Parameters
+    ----------
+    base_func
+        The base function to copy. Its code, globals, name, defaults, and
+        closure will be preserved.
+    string_annotations
+        A dict mapping parameter/return names to their string representations.
+        E.g., {"items": "UndefinedType", "return": "None"}
+
+    Returns
+    -------
+    object
+        A new function with a custom __annotate__ that:
+        - Raises NameError("name 'UndefinedType' is not defined") for VALUE format
+        - Returns string_annotations for STRING format
+        - Returns ForwardRef-wrapped values for FORWARDREF format
+
+    Examples
+    --------
+    >>> def my_func(items: object) -> None:
+    ...     pass
+    >>> pep649_func = create_pep649_function(
+    ...     my_func, {"items": "UndefinedType", "return": "None"}
+    ... )
+    >>> import inspect
+    >>> inspect.signature(pep649_func)  # Raises NameError
+    """
+    import types
+
+    from annotationlib import Format, ForwardRef
+
+    def annotate_raises(format: Format) -> dict[str, object]:
+        """Annotate function that raises NameError like PEP 649 with undefined types."""
+        if format == Format.VALUE:
+            raise NameError("name 'UndefinedType' is not defined")
+        if format == Format.STRING:
+            return string_annotations
+        # FORWARDREF format
+        return {k: ForwardRef(v) for k, v in string_annotations.items()}
+
+    func = types.FunctionType(
+        base_func.__code__,  # type: ignore[union-attr]
+        base_func.__globals__,  # type: ignore[union-attr]
+        base_func.__name__,  # type: ignore[union-attr]
+        base_func.__defaults__,  # type: ignore[union-attr]
+        base_func.__closure__,  # type: ignore[union-attr]
+    )
+    func.__annotate__ = annotate_raises  # type: ignore[attr-defined]
+    return func

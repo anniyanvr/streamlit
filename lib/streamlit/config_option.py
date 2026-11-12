@@ -1,4 +1,4 @@
-# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022)
+# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,15 +12,46 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""This class stores a key-value pair for the config system."""
+"""Class to store a key-value pair for the config system."""
 
-import datetime
+from __future__ import annotations
+
 import re
 import textwrap
-from typing import Any, Callable, Optional
+from datetime import datetime
+from typing import TYPE_CHECKING, Any
 
-from streamlit.errors import DeprecationError
-from streamlit import util
+from streamlit.string_util import to_snake_case
+from streamlit.util import repr_
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+# Dedent at definition time so interpolating a multi-line deprecation_text
+# (already flush-left from __init__) cannot make textwrap.dedent() a no-op.
+_UNSUPPORTED_OPTION_BANNER = textwrap.dedent(
+    """
+    ════════════════════════════════════════════════
+    {key} IS NO LONGER SUPPORTED.
+
+    {deprecation_text}
+
+    Please update {where_defined}.
+    ════════════════════════════════════════════════
+    """
+)
+_DEPRECATED_OPTION_BANNER = textwrap.dedent(
+    """
+    ════════════════════════════════════════════════
+    {key} IS DEPRECATED.
+    {deprecation_text}
+
+    This option will be removed on or after {expiration_date}.
+
+    Please update {where_defined}.
+    ════════════════════════════════════════════════
+    """
+)
 
 
 class ConfigOption:
@@ -54,7 +85,7 @@ class ConfigOption:
     key : str
         The fully qualified section.name
     value : any
-        The value for this option. If this is a a complex config option then
+        The value for this option. If this is a complex config option then
         the callback is called EACH TIME value is evaluated.
     section : str
         The section of this option. Example: 'global'.
@@ -79,6 +110,10 @@ class ConfigOption:
         See __init__.
     replaced_by : str or None
         See __init__.
+    sensitive : bool
+        See __init__.
+    env_var: str
+        The name of the environment variable that can be used to set the option.
     '''
 
     # This is a special value for ConfigOption.where_defined which indicates
@@ -92,16 +127,18 @@ class ConfigOption:
     def __init__(
         self,
         key: str,
-        description: Optional[str] = None,
-        default_val: Optional[Any] = None,
+        description: str | None = None,
+        default_val: Any | None = None,
         visibility: str = "visible",
         scriptable: bool = False,
         deprecated: bool = False,
-        deprecation_text: Optional[str] = None,
-        expiration_date: Optional[str] = None,
-        replaced_by: Optional[str] = None,
+        deprecation_text: str | None = None,
+        expiration_date: str | None = None,
+        replaced_by: str | None = None,
         type_: type = str,
-    ):
+        sensitive: bool = False,
+        multiple: bool = False,
+    ) -> None:
         """Create a ConfigOption with the given name.
 
         Parameters
@@ -133,6 +170,10 @@ class ConfigOption:
             meaningful default (unless you override it).
         type_ : one of str, int, float or bool
             Useful to cast the config params sent by cmd option parameter.
+        sensitive: bool
+            Sensitive configuration options cannot be set by CLI parameter.
+        multiple: bool
+            Whether this config option can have multiple values.
         """
         # Parse out the section and name.
         self.key = key
@@ -143,8 +184,11 @@ class ConfigOption:
             # with a lowercase letter with an optional "_" preceding it.
             # Examples: "_section", "section1"
             r"\_?[a-z][a-zA-Z0-9]*"
+            # Handling zero or additional parts, separated by period
+            # Examples: "_section.subsection", "section1._section2"
+            r"(\.[a-z][a-zA-Z0-9]*)*"
             r")"
-            # Separator between groups
+            # The final period, separating section and name
             r"\."
             # Capture a group called "name"
             r"(?P<name>"
@@ -155,7 +199,8 @@ class ConfigOption:
             r")$"
         )
         match = re.match(key_format, self.key)
-        assert match, f'Key "{self.key}" has invalid format.'
+        if match is None:
+            raise ValueError(f'Key "{self.key}" has invalid format.')
         self.section, self.name = match.group("section"), match.group("name")
 
         self.description = description
@@ -166,27 +211,31 @@ class ConfigOption:
         self.deprecated = deprecated
         self.replaced_by = replaced_by
         self.is_default = True
-        self._get_val_func: Optional[Callable[[], Any]] = None
+        self._get_val_func: Callable[[], Any] | None = None
         self.where_defined = ConfigOption.DEFAULT_DEFINITION
         self.type = type_
+        self.sensitive = sensitive
+        self.multiple = multiple
 
         if self.replaced_by:
             self.deprecated = True
             if deprecation_text is None:
-                deprecation_text = "Replaced by %s." % self.replaced_by
+                deprecation_text = f"Replaced by {self.replaced_by}."
 
         if self.deprecated:
-            assert expiration_date, "expiration_date is required for deprecated items"
-            assert deprecation_text, "deprecation_text is required for deprecated items"
+            if not expiration_date:
+                raise ValueError("expiration_date is required for deprecated items.")
+            if not deprecation_text:
+                raise ValueError("deprecation_text is required for deprecated items.")
             self.expiration_date = expiration_date
             self.deprecation_text = textwrap.dedent(deprecation_text)
 
         self.set_value(default_val)
 
     def __repr__(self) -> str:
-        return util.repr_(self)
+        return repr_(self)
 
-    def __call__(self, get_val_func: Callable[[], Any]) -> "ConfigOption":
+    def __call__(self, get_val_func: Callable[[], Any]) -> ConfigOption:
         """Assign a function to compute the value for this option.
 
         This method is called when ConfigOption is used as a decorator.
@@ -203,21 +252,20 @@ class ConfigOption:
             Returns self, which makes testing easier. See config_test.py.
 
         """
-        assert (
-            get_val_func.__doc__
-        ), "Complex config options require doc strings for their description."
-        self.description = get_val_func.__doc__
+        # Handle PYTHONOPTIMIZE=2 case where docstrings are stripped.
+        # Fall back to empty string instead of raising an error.
+        self.description = get_val_func.__doc__ or ""
         self._get_val_func = get_val_func
         return self
 
     @property
     def value(self) -> Any:
-        """Get the value of this config option."""
+        """The value of this config option."""
         if self._get_val_func is None:
             return None
         return self._get_val_func()
 
-    def set_value(self, value: Any, where_defined: Optional[str] = None) -> None:
+    def set_value(self, value: Any, where_defined: str | None = None) -> None:
         """Set the value of this option.
 
         Parameters
@@ -238,47 +286,26 @@ class ConfigOption:
         self.is_default = value == self.default_val
 
         if self.deprecated and self.where_defined != ConfigOption.DEFAULT_DEFINITION:
+            # Import here to avoid circular imports
+            from streamlit.logger import get_logger
 
-            details = {
-                "key": self.key,
-                "file": self.where_defined,
-                "explanation": self.deprecation_text,
-                "date": self.expiration_date,
-            }
-
+            logger = get_logger(__name__)
             if self.is_expired():
-                raise DeprecationError(
-                    textwrap.dedent(
-                        """
-                    ════════════════════════════════════════════════
-                    %(key)s IS NO LONGER SUPPORTED.
-
-                    %(explanation)s
-
-                    Please update %(file)s.
-                    ════════════════════════════════════════════════
-                    """
+                logger.error(
+                    _UNSUPPORTED_OPTION_BANNER.format(
+                        key=self.key,
+                        deprecation_text=self.deprecation_text,
+                        where_defined=self.where_defined,
                     )
-                    % details
                 )
             else:
-                from streamlit.logger import get_logger
-
-                LOGGER = get_logger(__name__)
-                LOGGER.warning(
-                    textwrap.dedent(
-                        """
-                    ════════════════════════════════════════════════
-                    %(key)s IS DEPRECATED.
-                    %(explanation)s
-
-                    This option will be removed on or after %(date)s.
-
-                    Please update %(file)s.
-                    ════════════════════════════════════════════════
-                    """
+                logger.warning(
+                    _DEPRECATED_OPTION_BANNER.format(
+                        key=self.key,
+                        deprecation_text=self.deprecation_text,
+                        expiration_date=self.expiration_date,
+                        where_defined=self.where_defined,
                     )
-                    % details
                 )
 
     def is_expired(self) -> bool:
@@ -287,10 +314,16 @@ class ConfigOption:
             return False
 
         expiration_date = _parse_yyyymmdd_str(self.expiration_date)
-        now = datetime.datetime.now()
+        now = datetime.now()
         return now > expiration_date
 
+    @property
+    def env_var(self) -> str:
+        """The name of the environment variable that can be used to set the option."""
+        name = self.key.replace(".", "_")
+        return f"STREAMLIT_{to_snake_case(name).upper()}"
 
-def _parse_yyyymmdd_str(date_str: str) -> datetime.datetime:
-    year, month, day = [int(token) for token in date_str.split("-", 2)]
-    return datetime.datetime(year, month, day)
+
+def _parse_yyyymmdd_str(date_str: str) -> datetime:
+    year, month, day = (int(token) for token in date_str.split("-", 2))
+    return datetime(year, month, day)

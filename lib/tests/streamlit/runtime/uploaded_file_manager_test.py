@@ -1,4 +1,4 @@
-# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022)
+# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,154 +14,300 @@
 
 """Unit tests for UploadedFileManager"""
 
+from __future__ import annotations
+
 import unittest
 
-from streamlit.runtime.stats import CacheStat
-from streamlit.runtime.uploaded_file_manager import UploadedFileManager
-from streamlit.runtime.uploaded_file_manager import UploadedFileRec
+from streamlit.proto.Common_pb2 import FileURLs as FileURLsProto
+from streamlit.runtime.memory_uploaded_file_manager import MemoryUploadedFileManager
+from streamlit.runtime.stats import CACHE_MEMORY_FAMILY, CacheStat
+from streamlit.runtime.uploaded_file_manager import UploadedFile, UploadedFileRec
+from tests.exception_capturing_thread import call_on_threads
 
-FILE_1 = UploadedFileRec(id=0, name="file1", type="type", data=b"file1")
-FILE_2 = UploadedFileRec(id=0, name="file2", type="type", data=b"file222")
+FILE_1 = UploadedFileRec(file_id="url1", name="file1", type="type", data=b"file1")
+FILE_2 = UploadedFileRec(file_id="url2", name="file2", type="type", data=b"file222")
 
 
 class UploadedFileManagerTest(unittest.TestCase):
     def setUp(self):
-        self.mgr = UploadedFileManager()
-        self.filemgr_events = []
-        self.mgr.on_files_updated.connect(self._on_files_updated)
-
-    def _on_files_updated(self, file_list, **kwargs):
-        self.filemgr_events.append(file_list)
+        self.mgr = MemoryUploadedFileManager("/mock/upload")
 
     def test_added_file_id(self):
-        """An added file should have a unique ID."""
-        f1 = self.mgr.add_file("session", "widget", FILE_1)
-        f2 = self.mgr.add_file("session", "widget", FILE_1)
-        self.assertNotEqual(FILE_1.id, f1.id)
-        self.assertNotEqual(f1.id, f2.id)
-
-    def test_added_file_properties(self):
-        """An added file should maintain all its source properties
-        except its ID."""
-        added = self.mgr.add_file("session", "widget", FILE_1)
-        self.assertNotEqual(added.id, FILE_1.id)
-        self.assertEqual(added.name, FILE_1.name)
-        self.assertEqual(added.type, FILE_1.type)
-        self.assertEqual(added.data, FILE_1.data)
+        """Presigned file URL should have a unique ID."""
+        info1, info2 = self.mgr.get_upload_urls("session", ["name1", "name1"])
+        assert info1.file_id != info2.file_id
 
     def test_retrieve_added_file(self):
-        """After adding a file to the mgr, we should be able to get it back."""
-        self.assertEqual([], self.mgr.get_all_files("non-report", "non-widget"))
+        """An added file should maintain all its source properties
+        except its ID."""
+        self.mgr.add_file("session", FILE_1)
+        self.mgr.add_file("session", FILE_2)
 
-        file_1 = self.mgr.add_file("session", "widget", FILE_1)
-        self.assertEqual([file_1], self.mgr.get_all_files("session", "widget"))
-        self.assertEqual([file_1], self.mgr.get_files("session", "widget", [file_1.id]))
-        self.assertEqual(len(self.filemgr_events), 1)
+        file1_from_storage, *rest_files = self.mgr.get_files("session", ["url1"])
+        assert len(rest_files) == 0
+        assert file1_from_storage.file_id == FILE_1.file_id
+        assert file1_from_storage.name == FILE_1.name
+        assert file1_from_storage.type == FILE_1.type
+        assert file1_from_storage.data == FILE_1.data
 
-        # Add another file
-        file_2 = self.mgr.add_file("session", "widget", FILE_2)
-        self.assertEqual([file_1, file_2], self.mgr.get_all_files("session", "widget"))
-        self.assertEqual([file_1], self.mgr.get_files("session", "widget", [file_1.id]))
-        self.assertEqual([file_2], self.mgr.get_files("session", "widget", [file_2.id]))
-        self.assertEqual(len(self.filemgr_events), 2)
+        file2_from_storage, *other_files = self.mgr.get_files("session", ["url2"])
+        assert len(other_files) == 0
+        assert file2_from_storage.file_id == FILE_2.file_id
+        assert file2_from_storage.name == FILE_2.name
+        assert file2_from_storage.type == FILE_2.type
+        assert file2_from_storage.data == FILE_2.data
 
     def test_remove_file(self):
         # This should not error.
-        self.mgr.remove_files("non-report", "non-widget")
+        self.mgr.remove_file("non-session", "non-file-id")
 
-        f1 = self.mgr.add_file("session", "widget", FILE_1)
-        self.mgr.remove_file("session", "widget", f1.id)
-        self.assertEqual([], self.mgr.get_all_files("session", "widget"))
+        self.mgr.add_file("session", FILE_1)
+        self.mgr.remove_file("session", FILE_1.file_id)
+        assert self.mgr.get_files("session", [FILE_1.file_id]) == []
 
         # Remove the file again. It doesn't exist, but this isn't an error.
-        self.mgr.remove_file("session", "widget", f1.id)
-        self.assertEqual([], self.mgr.get_all_files("session", "widget"))
+        self.mgr.remove_file("session", FILE_1.file_id)
+        assert self.mgr.get_files("session", [FILE_1.file_id]) == []
 
-        f1 = self.mgr.add_file("session", "widget", FILE_1)
-        f2 = self.mgr.add_file("session", "widget", FILE_2)
-        self.mgr.remove_file("session", "widget", f1.id)
-        self.assertEqual([f2], self.mgr.get_all_files("session", "widget"))
-
-    def test_remove_widget_files(self):
-        # This should not error.
-        self.mgr.remove_session_files("non-report")
-
-        # Add two files with different session IDs, but the same widget ID.
-        f1 = self.mgr.add_file("session1", "widget", FILE_1)
-        f2 = self.mgr.add_file("session2", "widget", FILE_1)
-
-        self.mgr.remove_files("session1", "widget")
-        self.assertEqual([], self.mgr.get_all_files("session1", "widget"))
-        self.assertEqual([f2], self.mgr.get_all_files("session2", "widget"))
+        self.mgr.add_file("session", FILE_1)
+        self.mgr.add_file("session", FILE_2)
+        self.mgr.remove_file("session", FILE_1.file_id)
+        assert self.mgr.get_files("session", [FILE_1.file_id, FILE_2.file_id]) == [
+            FILE_2
+        ]
 
     def test_remove_session_files(self):
         # This should not error.
         self.mgr.remove_session_files("non-report")
 
         # Add two files with different session IDs, but the same widget ID.
-        f1 = self.mgr.add_file("session1", "widget1", FILE_1)
-        f2 = self.mgr.add_file("session1", "widget2", FILE_1)
-        f3 = self.mgr.add_file("session2", "widget", FILE_1)
+        self.mgr.add_file("session1", FILE_1)
+        self.mgr.add_file("session1", FILE_2)
+
+        self.mgr.add_file("session2", FILE_1)
 
         self.mgr.remove_session_files("session1")
-        self.assertEqual([], self.mgr.get_all_files("session1", "widget1"))
-        self.assertEqual([], self.mgr.get_all_files("session1", "widget2"))
-        self.assertEqual([f3], self.mgr.get_all_files("session2", "widget"))
-
-    def test_remove_orphaned_files(self):
-        """Test the remove_orphaned_files behavior"""
-        f1 = self.mgr.add_file("session1", "widget1", FILE_1)
-        f2 = self.mgr.add_file("session1", "widget1", FILE_1)
-        f3 = self.mgr.add_file("session1", "widget1", FILE_1)
-        self.assertEqual([f1, f2, f3], self.mgr.get_all_files("session1", "widget1"))
-
-        # Nothing should be removed here (all files are active).
-        self.mgr.remove_orphaned_files(
-            "session1",
-            "widget1",
-            newest_file_id=f3.id,
-            active_file_ids=[f1.id, f2.id, f3.id],
-        )
-        self.assertEqual([f1, f2, f3], self.mgr.get_all_files("session1", "widget1"))
-
-        # Nothing should be removed here (no files are active, but they're all
-        # "newer" than newest_file_id).
-        self.mgr.remove_orphaned_files(
-            "session1", "widget1", newest_file_id=f1.id - 1, active_file_ids=[]
-        )
-        self.assertEqual([f1, f2, f3], self.mgr.get_all_files("session1", "widget1"))
-
-        # f2 should be removed here (it's not in the active file list)
-        self.mgr.remove_orphaned_files(
-            "session1", "widget1", newest_file_id=f3.id, active_file_ids=[f1.id, f3.id]
-        )
-        self.assertEqual([f1, f3], self.mgr.get_all_files("session1", "widget1"))
-
-        # remove_orphaned_files on an untracked session/widget should not error
-        self.mgr.remove_orphaned_files(
-            "no_session", "no_widget", newest_file_id=0, active_file_ids=[]
-        )
+        assert self.mgr.get_files("session1", [FILE_1.file_id, FILE_2.file_id]) == []
+        assert self.mgr.get_files("session2", [FILE_1.file_id]) == [FILE_1]
 
     def test_cache_stats_provider(self):
-        """Test CacheStatsProvider implementation."""
+        """Test StatsProvider implementation."""
 
         # Test empty manager
-        self.assertEqual([], self.mgr.get_stats())
+        assert self.mgr.get_stats() == {}
 
         # Test manager with files
-        self.mgr.add_file("session1", "widget1", FILE_1)
-        self.mgr.add_file("session1", "widget2", FILE_2)
+        self.mgr.add_file("session1", FILE_1)
+        self.mgr.add_file("session1", FILE_2)
 
-        expected = [
-            CacheStat(
-                category_name="UploadedFileManager",
-                cache_name="",
-                byte_length=len(FILE_1.data),
-            ),
-            CacheStat(
-                category_name="UploadedFileManager",
-                cache_name="",
-                byte_length=len(FILE_2.data),
-            ),
-        ]
-        self.assertEqual(expected, self.mgr.get_stats())
+        expected_stat = CacheStat(
+            category_name="UploadedFileManager",
+            cache_name="",
+            byte_length=len(FILE_1.data) + len(FILE_2.data),
+        )
+        expected = {expected_stat.family_name: [expected_stat]}
+        assert expected == self.mgr.get_stats()
+
+    def test_cache_stats_updates_on_file_replacement_and_removal(self):
+        replacement = UploadedFileRec(
+            file_id=FILE_1.file_id,
+            name="replacement",
+            type="type",
+            data=b"replacement",
+        )
+
+        self.mgr.add_file("session1", FILE_1)
+        self.mgr.add_file("session1", replacement)
+        self.mgr.add_file("session2", FILE_2)
+
+        stats = self.mgr.get_stats()
+        assert stats[CACHE_MEMORY_FAMILY][0].byte_length == len(replacement.data) + len(
+            FILE_2.data
+        )
+
+        self.mgr.remove_file("session2", FILE_2.file_id)
+        stats = self.mgr.get_stats()
+        assert stats[CACHE_MEMORY_FAMILY][0].byte_length == len(replacement.data)
+
+        self.mgr.remove_session_files("session1")
+        assert self.mgr.get_stats() == {}
+
+    def test_cache_stats_includes_zero_byte_uploads(self):
+        """Zero-byte uploads still produce a stat (not dropped from metrics)."""
+        empty_file = UploadedFileRec(
+            file_id="empty",
+            name="empty",
+            type="type",
+            data=b"",
+        )
+        self.mgr.add_file("session1", empty_file)
+
+        stats = self.mgr.get_stats()
+        assert stats[CACHE_MEMORY_FAMILY][0].byte_length == 0
+
+        # Removing the only file clears the stats again.
+        self.mgr.remove_file("session1", empty_file.file_id)
+        assert self.mgr.get_stats() == {}
+
+
+class UploadedFileManagerThreadingTest(unittest.TestCase):
+    # The number of threads to run our tests on
+    NUM_THREADS = 50
+
+    def setUp(self) -> None:
+        self.mgr = MemoryUploadedFileManager("/mock/upload")
+
+    def test_add_file(self):
+        """`add_file` is thread-safe."""
+        # Call `add_file` from a bunch of threads
+        added_files = []
+
+        def add_file(index: int) -> None:
+            file = UploadedFileRec(
+                file_id=f"id_{index}",
+                name=f"file_{index}",
+                type="type",
+                data=bytes(f"{index}", "utf-8"),
+            )
+
+            self.mgr.add_file("session", file)
+            files_from_storage = self.mgr.get_files("session", [file.file_id])
+            added_files.extend(files_from_storage)
+
+        call_on_threads(add_file, num_threads=self.NUM_THREADS)
+
+        # Ensure all our files are present
+        for ii in range(self.NUM_THREADS):
+            files = self.mgr.get_files("session", [f"id_{ii}"])
+            assert len(files) == 1
+            assert bytes(f"{ii}", "utf-8") == files[0].data
+
+        # Ensure all files have unique IDs
+        file_ids = set()
+        file_ids.update(
+            file_rec.file_id for file_rec in self.mgr.file_storage["session"].values()
+        )
+        assert len(file_ids) == self.NUM_THREADS
+
+    def test_remove_file(self):
+        """`remove_file` is thread-safe."""
+        # Add a bunch of files to a single widget
+        file_ids = []
+        for ii in range(self.NUM_THREADS):
+            file = UploadedFileRec(
+                file_id=f"id_{ii}",
+                name=f"file_{ii}",
+                type="type",
+                data=b"123",
+            )
+            self.mgr.add_file("session", file)
+            file_ids.append(file.file_id)
+
+        # Have each thread remove a single file
+        def remove_file(index: int) -> None:
+            file_id = file_ids[index]
+
+            # Ensure our file exists
+            get_files_result = self.mgr.get_files("session", [file_id])
+            assert len(get_files_result) == 1
+
+            # Remove our file and ensure our file no longer exists
+            self.mgr.remove_file("session", file_id)
+            get_files_result = self.mgr.get_files("session", [file_id])
+            assert len(get_files_result) == 0
+
+        call_on_threads(remove_file, self.NUM_THREADS)
+
+        assert len(self.mgr.file_storage["session"]) == 0
+
+    def test_remove_session_files(self):
+        """`remove_session_files` is thread-safe."""
+        # Add a bunch of files, each to a different session
+        file_ids = []
+        for ii in range(self.NUM_THREADS):
+            file = UploadedFileRec(
+                file_id=f"id_{ii}",
+                name=f"file_{ii}",
+                type="type",
+                data=b"123",
+            )
+            self.mgr.add_file(f"session_{ii}", file)
+            file_ids.append(file.file_id)
+
+        # Have each thread remove its session's file
+        def remove_session_files(index: int) -> None:
+            session_id = f"session_{index}"
+            # Our file should exist
+            session_files = self.mgr.get_files(session_id, [f"id_{index}"])
+            assert len(session_files) == 1
+            assert file_ids[index] == session_files[0].file_id
+
+            # Remove session files
+            self.mgr.remove_session_files(session_id)
+
+            # Our file should no longer exist
+            session_files = self.mgr.get_files(session_id, [f"id_{index}"])
+            assert len(session_files) == 0
+
+        call_on_threads(remove_session_files, num_threads=self.NUM_THREADS)
+
+    def test_byte_accounting_is_thread_safe(self):
+        """The tracked total byte count stays consistent under concurrent
+        add/remove operations.
+        """
+        # Each thread adds a file and then removes a different thread's file, so
+        # adds and removes interleave on the shared byte counter.
+        for ii in range(self.NUM_THREADS):
+            self.mgr.add_file(
+                "session",
+                UploadedFileRec(
+                    file_id=f"seed_{ii}", name=f"seed_{ii}", type="type", data=b"123"
+                ),
+            )
+
+        def churn(index: int) -> None:
+            self.mgr.add_file(
+                "session",
+                UploadedFileRec(
+                    file_id=f"id_{index}",
+                    name=f"file_{index}",
+                    type="type",
+                    data=b"12345",
+                ),
+            )
+            self.mgr.remove_file("session", f"seed_{index}")
+
+        call_on_threads(churn, num_threads=self.NUM_THREADS)
+
+        expected_bytes = sum(
+            len(file.data) for file in self.mgr.file_storage["session"].values()
+        )
+        assert self.mgr._total_bytes == expected_bytes
+        assert (
+            self.mgr.get_stats()[CACHE_MEMORY_FAMILY][0].byte_length == expected_bytes
+        )
+
+
+def _make_uploaded_file(file_id: str, data: bytes = b"abc") -> UploadedFile:
+    rec = UploadedFileRec(
+        file_id=file_id, name="file.txt", type="text/plain", data=data
+    )
+    urls = FileURLsProto(file_id=file_id, upload_url="u", delete_url="d")
+    return UploadedFile(rec, urls)
+
+
+def test_uploaded_file_equality_is_based_on_file_id() -> None:
+    """UploadedFile instances compare equal when they share a file_id."""
+    first = _make_uploaded_file("id-1", b"aaa")
+    second = _make_uploaded_file("id-1", b"bbb")
+    other = _make_uploaded_file("id-2", b"aaa")
+
+    assert first == second
+    assert first != other
+    assert first.__eq__(object()) is NotImplemented
+
+
+def test_uploaded_file_repr_includes_class_name() -> None:
+    """repr() includes the class name."""
+    uploaded = _make_uploaded_file("id-1")
+    assert "UploadedFile" in repr(uploaded)

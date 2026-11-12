@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022)
+# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,33 +12,27 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
 
 import subprocess
 import sys
 import textwrap
 from pathlib import Path
-from typing import Tuple, List
 
-if __name__ not in ("__main__", "__mp_main__"):
+if __name__ not in {"__main__", "__mp_main__"}:
     raise SystemExit(
         "This file is intended to be executed as an executable program. You cannot use "
         "it as a module.To run this script, run the ./{__file__} command"
     )
 
 
-def is_relative_to(path: Path, *other):
-    """Return True if the path is relative to another path or False.
+def is_relative_to(path: Path, other: str) -> bool:
+    """Return True if the path is relative to another path or False."""
 
-    This function is backported from Python 3.9 - Path.relativeto.
-    """
-    try:
-        path.relative_to(*other)
-        return True
-    except ValueError:
-        return False
+    return path.is_relative_to(other)
 
 
-def display_usage():
+def display_usage() -> None:
     prog = Path(__file__).name
     print(
         textwrap.dedent(
@@ -66,8 +60,8 @@ def display_usage():
     )
 
 
-def parse_args() -> Tuple[str, List[str]]:
-    if len(sys.argv) == 2 and sys.argv[1] in ("-h", "--help"):
+def parse_args() -> tuple[str, list[str]]:
+    if len(sys.argv) == 2 and sys.argv[1] in {"-h", "--help"}:
         display_usage()
         sys.exit(0)
     if len(sys.argv) < 3:
@@ -86,7 +80,23 @@ def fix_arg(subdirectory: str, arg: str) -> str:
     return str(arg_path.relative_to(subdirectory))
 
 
-def main():
+def try_as_shell(fixed_args: list[str], subdirectory: str) -> None:
+    # Windows doesn't know how to run "yarn" using the CreateProcess
+    # WINAPI because it's looking for an executable, and yarn is a node script.
+    # Yarn happens to be the only thing currently run with this patching script,
+    # so add a fall-back which tries to run the requested command in a shell
+    # if directly calling the process doesn't work.
+
+    print("Direct call failed, trying as shell command:")
+    shell_cmd = " ".join(fixed_args)
+    print(shell_cmd)
+    try:
+        subprocess.run(shell_cmd, cwd=subdirectory, check=True, shell=True)
+    except subprocess.CalledProcessError as ex:
+        sys.exit(ex.returncode)
+
+
+def main() -> None:
     subdirectory, subprocess_args = parse_args()
 
     fixed_args = [fix_arg(subdirectory, arg) for arg in subprocess_args]
@@ -94,6 +104,11 @@ def main():
         subprocess.run(fixed_args, cwd=subdirectory, check=True)
     except subprocess.CalledProcessError as ex:
         sys.exit(ex.returncode)
+    except FileNotFoundError:
+        if "win32" in sys.platform:
+            try_as_shell(fixed_args, subdirectory)
+        else:
+            sys.exit(1)
 
 
 main()

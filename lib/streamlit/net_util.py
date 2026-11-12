@@ -1,4 +1,4 @@
-# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022)
+# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,56 +12,61 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import socket
-from typing import Optional
+from __future__ import annotations
 
-import requests
-from typing_extensions import Final
+import functools
+from typing import Final
 
-from streamlit import util
 from streamlit.logger import get_logger
 
-LOGGER = get_logger(__name__)
+_LOGGER: Final = get_logger(__name__)
 
-# URL for checking the current machine's external IP address.
+# URLs for checking the current machine's external IP address.
 _AWS_CHECK_IP: Final = "http://checkip.amazonaws.com"
+_AWS_CHECK_IP_HTTPS: Final = "https://checkip.amazonaws.com"
 
-_external_ip: Optional[str] = None
-_internal_ip: Optional[str] = None
+# URL of Streamlit's help page.
+_HELP_DOC: Final = "https://docs.streamlit.io/"
+
+_internal_ip: str | None = None
 
 
-def get_external_ip() -> Optional[str]:
+# Cache failed lookups too: the WebSocket origin check calls this
+# synchronously on the event loop, so retrying on hosts without outbound
+# internet access would stall the server on every cross-origin handshake.
+@functools.cache
+def get_external_ip() -> str | None:
     """Get the *external* IP address of the current machine.
+
+    The first result, including a failed lookup, is cached for the lifetime
+    of the process.
 
     Returns
     -------
-    string
-        The external IPv4 address of the current machine.
+    str or None
+        The external IPv4 or IPv6 address, or ``None`` if the lookup failed.
 
     """
-    global _external_ip
+    # The external IP is best-effort: used for the headless External URL banner
+    # and as a fallback in the CORS / WebSocket-origin allowlist. We use a 1s
+    # timeout to avoid startup delays; misses fail closed and admins should
+    # configure browser.serverAddress / server.corsAllowedOrigins explicitly.
+    response = _make_blocking_http_get(_AWS_CHECK_IP, timeout=1)
 
-    if _external_ip is not None:
-        return _external_ip
+    if response is None:
+        response = _make_blocking_http_get(_AWS_CHECK_IP_HTTPS, timeout=1)
 
-    response = _make_blocking_http_get(_AWS_CHECK_IP, timeout=5)
+    if _looks_like_an_ip_address(response):
+        return response
 
-    if _looks_like_an_ip_adress(response):
-        _external_ip = response
-    else:
-        LOGGER.warning(
-            # fmt: off
-            "Did not auto detect external IP.\n"
-            "Please go to %s for debugging hints.",
-            # fmt: on
-            util.HELP_DOC
-        )
-        _external_ip = None
-
-    return _external_ip
+    _LOGGER.warning(
+        "Did not auto detect external IP.\nPlease go to %s for debugging hints.",
+        _HELP_DOC,
+    )
+    return None
 
 
-def get_internal_ip() -> Optional[str]:
+def get_internal_ip() -> str | None:
     """Get the *local* IP address of the current machine.
 
     From: https://stackoverflow.com/a/28950776
@@ -72,25 +77,27 @@ def get_internal_ip() -> Optional[str]:
         The local IPv4 address of the current machine.
 
     """
-    global _internal_ip
+    global _internal_ip  # noqa: PLW0603
 
     if _internal_ip is not None:
         return _internal_ip
 
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        # Doesn't even have to be reachable
-        s.connect(("8.8.8.8", 1))
-        _internal_ip = s.getsockname()[0]
-    except Exception:
-        _internal_ip = "127.0.0.1"
-    finally:
-        s.close()
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        try:
+            # Doesn't even have to be reachable
+            s.connect(("8.8.8.8", 1))
+            _internal_ip = s.getsockname()[0]
+        except Exception:
+            _internal_ip = "127.0.0.1"
 
     return _internal_ip
 
 
-def _make_blocking_http_get(url: str, timeout: float = 5) -> Optional[str]:
+def _make_blocking_http_get(url: str, timeout: float = 5) -> str | None:
+    import requests
+
     try:
         text = requests.get(url, timeout=timeout).text
         if isinstance(text, str):
@@ -100,9 +107,11 @@ def _make_blocking_http_get(url: str, timeout: float = 5) -> Optional[str]:
         return None
 
 
-def _looks_like_an_ip_adress(address: Optional[str]) -> bool:
+def _looks_like_an_ip_address(address: str | None) -> bool:
     if address is None:
         return False
+
+    import socket
 
     try:
         socket.inet_pton(socket.AF_INET, address)

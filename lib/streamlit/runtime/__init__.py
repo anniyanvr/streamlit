@@ -1,4 +1,4 @@
-# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022)
+# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,16 +12,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Explicitly re-export public symbols from runtime.py
-from .runtime import (
-    Runtime as Runtime,
-    RuntimeState as RuntimeState,
-    SessionClient as SessionClient,
-    SessionClientDisconnectedError as SessionClientDisconnectedError,
-    RuntimeConfig as RuntimeConfig,
+from __future__ import annotations
+
+from streamlit.runtime.runtime import Runtime, RuntimeConfig, RuntimeState
+from streamlit.runtime.session_manager import (
+    SessionClient,
+    SessionClientDisconnectedError,
 )
 
 
 def get_instance() -> Runtime:
-    """Return the singleton Runtime instance."""
+    """Return the singleton Runtime instance. Raise an Error if the
+    Runtime hasn't been created yet.
+    """
     return Runtime.instance()
+
+
+def exists() -> bool:
+    """True if the singleton Runtime instance has been created.
+
+    When a Streamlit app is running in "raw mode" - that is, when the
+    app is run via `python app.py` instead of `streamlit run app.py` -
+    the Runtime will not exist, and various Streamlit functions need
+    to adapt.
+    """
+    return Runtime.exists()
+
+
+__all__ = [
+    "Runtime",
+    "RuntimeConfig",
+    "RuntimeState",
+    "SessionClient",
+    "SessionClientDisconnectedError",
+    "exists",
+    "get_instance",
+]

@@ -1,4 +1,4 @@
-# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022)
+# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,139 +13,235 @@
 # limitations under the License.
 
 """Allows us to create and absorb changes (aka Deltas) to elements."""
+
+from __future__ import annotations
+
+import sys
+import threading
+from collections.abc import Callable, Iterable
+from copy import deepcopy
 from typing import (
-    Any,
-    Callable,
-    cast,
-    Dict,
-    Hashable,
-    Optional,
-    overload,
-    Iterable,
-    NoReturn,
-    Tuple,
-    Type,
-    TypeVar,
     TYPE_CHECKING,
-    Union,
+    Any,
+    Final,
+    Literal,
+    NoReturn,
+    TypeAlias,
+    TypeVar,
+    cast,
 )
 
-from typing_extensions import Final, Literal
-
-import streamlit as st
-from streamlit import cursor
-from streamlit.runtime import caching, legacy_caching
-from streamlit import type_util
-from streamlit import util
-from streamlit.cursor import Cursor
-from streamlit.runtime.scriptrunner import get_script_run_ctx
-from streamlit.errors import StreamlitAPIException
-from streamlit.errors import NoSessionContext
-from streamlit.proto import Block_pb2
-from streamlit.proto import ForwardMsg_pb2
-from streamlit.proto.RootContainer_pb2 import RootContainer
-from streamlit.logger import get_logger
-
-from streamlit.elements.balloons import BalloonsMixin
-from streamlit.elements.button import ButtonMixin
-from streamlit.elements.markdown import MarkdownMixin
-from streamlit.elements.heading import HeadingMixin
-from streamlit.elements.text import TextMixin
+from streamlit import (
+    cli_util,
+    config,
+    cursor,
+    env_util,
+    logger,
+    runtime,
+    util,
+)
+from streamlit.components.v2.bidi_component import BidiComponentMixin
+from streamlit.delta_generator_singletons import (
+    context_dg_stack,
+    get_last_dg_added_to_context_stack,
+)
 from streamlit.elements.alert import AlertMixin
-from streamlit.elements.json import JsonMixin
-from streamlit.elements.doc_string import HelpMixin
-from streamlit.elements.exception import ExceptionMixin
-from streamlit.elements.bokeh_chart import BokehMixin
-from streamlit.elements.graphviz_chart import GraphvizMixin
-from streamlit.elements.plotly_chart import PlotlyMixin
-from streamlit.elements.deck_gl_json_chart import PydeckMixin
-from streamlit.elements.map import MapMixin
-from streamlit.elements.iframe import IframeMixin
-from streamlit.elements.media import MediaMixin
-from streamlit.elements.checkbox import CheckboxMixin
-from streamlit.elements.multiselect import MultiSelectMixin
-from streamlit.elements.metric import MetricMixin
-from streamlit.elements.radio import RadioMixin
-from streamlit.elements.selectbox import SelectboxMixin
-from streamlit.elements.text_widgets import TextWidgetsMixin
-from streamlit.elements.time_widgets import TimeWidgetsMixin
-from streamlit.elements.progress import ProgressMixin
-from streamlit.elements.empty import EmptyMixin
-from streamlit.elements.number_input import NumberInputMixin
-from streamlit.elements.camera_input import CameraInputMixin
-from streamlit.elements.color_picker import ColorPickerMixin
-from streamlit.elements.file_uploader import FileUploaderMixin
-from streamlit.elements.select_slider import SelectSliderMixin
-from streamlit.elements.slider import SliderMixin
-from streamlit.elements.snow import SnowMixin
-from streamlit.elements.image import ImageMixin
-from streamlit.elements.pyplot import PyplotMixin
-from streamlit.elements.write import WriteMixin
-from streamlit.elements.layouts import LayoutsMixin
-from streamlit.elements.form import FormMixin, FormData, current_form_id
-from streamlit.runtime.state import NoValue
-
-# DataFrame elements come in two flavors: "Legacy" and "Arrow".
-# We select between them with the DataFrameElementSelectorMixin.
 from streamlit.elements.arrow import ArrowMixin
-from streamlit.elements.arrow_altair import ArrowAltairMixin
-from streamlit.elements.arrow_vega_lite import ArrowVegaLiteMixin
-from streamlit.elements.legacy_data_frame import LegacyDataFrameMixin
-from streamlit.elements.legacy_altair import LegacyAltairMixin
-from streamlit.elements.legacy_vega_lite import LegacyVegaLiteMixin
-from streamlit.elements.dataframe_selector import DataFrameSelectorMixin
+from streamlit.elements.balloons import BalloonsMixin
+from streamlit.elements.code import CodeMixin
+from streamlit.elements.deck_gl_json_chart import PydeckMixin
+from streamlit.elements.echarts_chart import EChartsMixin
+from streamlit.elements.empty import EmptyMixin
+from streamlit.elements.exception import ExceptionMixin
+from streamlit.elements.form import FormMixin
+from streamlit.elements.graphviz_chart import GraphvizMixin
+from streamlit.elements.heading import HeadingMixin
+from streamlit.elements.help import HelpMixin
+from streamlit.elements.html import HtmlMixin
+from streamlit.elements.iframe import IframeMixin
+from streamlit.elements.image import ImageMixin
+from streamlit.elements.json import JsonMixin
+from streamlit.elements.layouts import LayoutsMixin
+from streamlit.elements.lib import agent_spec
+from streamlit.elements.lib.form_utils import FormData, current_form_id
+from streamlit.elements.lib.layout_utils import (
+    get_height_config,
+    get_text_alignment_config,
+    get_width_config,
+    validate_text_alignment,
+)
+from streamlit.elements.map import MapMixin
+from streamlit.elements.markdown import MarkdownMixin
+from streamlit.elements.media import MediaMixin
+from streamlit.elements.mermaid_chart import MermaidChartMixin
+from streamlit.elements.metric import MetricMixin
+from streamlit.elements.pdf import PdfMixin
+from streamlit.elements.plotly_chart import PlotlyMixin
+from streamlit.elements.progress import ProgressMixin
+from streamlit.elements.pyplot import PyplotMixin
+from streamlit.elements.skeleton import SkeletonMixin
+from streamlit.elements.snow import SnowMixin
+from streamlit.elements.space import SpaceMixin
+from streamlit.elements.spinner import SpinnerMixin
+from streamlit.elements.table import TableMixin
+from streamlit.elements.text import TextMixin
+from streamlit.elements.toast import ToastMixin
+from streamlit.elements.vega_charts import VegaChartsMixin
+from streamlit.elements.widgets.audio_input import AudioInputMixin
+from streamlit.elements.widgets.button import ButtonMixin
+from streamlit.elements.widgets.button_group import ButtonGroupMixin
+from streamlit.elements.widgets.camera_input import CameraInputMixin
+from streamlit.elements.widgets.chat import ChatMixin
+from streamlit.elements.widgets.checkbox import CheckboxMixin
+from streamlit.elements.widgets.color_picker import ColorPickerMixin
+from streamlit.elements.widgets.data_editor import DataEditorMixin
+from streamlit.elements.widgets.feedback import FeedbackMixin
+from streamlit.elements.widgets.file_uploader import FileUploaderMixin
+from streamlit.elements.widgets.menu_button import MenuButtonMixin
+from streamlit.elements.widgets.multiselect import MultiSelectMixin
+from streamlit.elements.widgets.number_input import NumberInputMixin
+from streamlit.elements.widgets.pagination import PaginationMixin
+from streamlit.elements.widgets.radio import RadioMixin
+from streamlit.elements.widgets.select_slider import SelectSliderMixin
+from streamlit.elements.widgets.selectbox import SelectboxMixin
+from streamlit.elements.widgets.slider import SliderMixin
+from streamlit.elements.widgets.text_widgets import TextWidgetsMixin
+from streamlit.elements.widgets.time_widgets import TimeWidgetsMixin
+from streamlit.elements.write import WriteMixin
+from streamlit.errors import (
+    NoSessionContext,
+    StreamlitAPIException,
+    StreamlitInvalidLayoutContextError,
+)
+from streamlit.proto import Block_pb2
+from streamlit.proto.ForwardMsg_pb2 import ForwardMsg
+from streamlit.proto.RootContainer_pb2 import RootContainer
+from streamlit.runtime import caching
+from streamlit.runtime.outside_container_wrapper import OutsideContainerWrapper
+from streamlit.runtime.scriptrunner import enqueue_message as _enqueue_message
+from streamlit.runtime.scriptrunner import get_script_run_ctx
+from streamlit.runtime.scriptrunner_utils.script_run_context import (
+    ThreadState,
+    is_fragment_callback_warning_suppressed,
+)
 
 if TYPE_CHECKING:
-    from numpy import typing as npt
-    from pandas import DataFrame, Series
+    from types import TracebackType
+
     from google.protobuf.message import Message
-    from streamlit.elements.arrow import Data
 
-
-LOGGER: Final = get_logger(__name__)
-
-# Save the type built-in for when we override the name "type".
-_type = type
+    from streamlit.cursor import Cursor
+    from streamlit.elements.lib.layout_utils import LayoutConfig
+    from streamlit.proto.Element_pb2 import Element as ElementProto
+    from streamlit.runtime.fragment import FragmentStorage
+    from streamlit.runtime.scriptrunner_utils.script_run_context import (
+        FragmentThreadState,
+        ScriptRunContext,
+    )
 
 MAX_DELTA_BYTES: Final[int] = 14 * 1024 * 1024  # 14MB
 
-# List of Streamlit commands that perform a Pandas "melt" operation on
-# input dataframes.
-DELTA_TYPES_THAT_MELT_DATAFRAMES: Final = ("line_chart", "area_chart", "bar_chart")
-ARROW_DELTA_TYPES_THAT_MELT_DATAFRAMES: Final = (
-    "arrow_line_chart",
-    "arrow_area_chart",
-    "arrow_bar_chart",
-)
-
 Value = TypeVar("Value")
-DG = TypeVar("DG", bound="DeltaGenerator")
+
+# Type aliases for Ancestor Block Types
+BlockType: TypeAlias = str
+AncestorBlockTypes: TypeAlias = Iterable[BlockType]
+ForwardMsgCreator: TypeAlias = Callable[[], ForwardMsg]
+
+
+_use_warning_has_been_displayed: bool = False
+
+
+def _maybe_print_use_warning() -> None:
+    """Print a warning if Streamlit is imported but not being run with `streamlit run`.
+    The warning is printed only once, and is printed using the root logger.
+    """
+    global _use_warning_has_been_displayed  # noqa: PLW0603
+
+    if not _use_warning_has_been_displayed:
+        _use_warning_has_been_displayed = True
+
+        warning = cli_util.style_for_cli("Warning:", bold=True, fg="yellow")
+
+        if env_util.is_repl():
+            logger.get_logger("root").warning(
+                f"\n  {warning} to view a Streamlit app on a browser, use Streamlit in "
+                "a file and\n  run it with the following command:\n\n    streamlit run "
+                "[FILE_NAME] [ARGUMENTS]"
+            )
+
+        elif not runtime.exists() and config.get_option(
+            "global.showWarningOnDirectExecution"
+        ):
+            script_name = sys.argv[0]
+
+            logger.get_logger("root").warning(
+                f"\n  {warning} to view this Streamlit app on a browser, run it with "
+                f"the following\n  command:\n\n    streamlit run {script_name} "
+                "[ARGUMENTS]"
+            )
+
+
+def _maybe_print_fragment_callback_warning() -> None:
+    """Print a warning if elements are being modified during a fragment callback."""
+    ctx = get_script_run_ctx()
+    # Invariant: ThreadState is initialized whenever a ScriptRunContext exists
+    # on this thread, since ScriptRunContext.reset() and add_script_run_ctx()
+    # are the only public entry points for binding ctx, and both seed
+    # ThreadState. ThreadState.get() is therefore safe here without a guard.
+    if not ctx or not ThreadState.get().in_fragment_callback:
+        return
+
+    # The internal yield-point placeholder is not a user element. The runner
+    # raises in _enqueue_forward_msg before sending it. Skip the warning for
+    # that write. Read the flag only on this path so ordinary element writes
+    # skip the ContextVar lookup.
+    if is_fragment_callback_warning_suppressed():
+        return
+
+    warning = cli_util.style_for_cli("Warning:", bold=True, fg="yellow")
+
+    logger.get_logger("root").warning(
+        f"\n  {warning} A fragment rerun was triggered with a callback that displays one or more elements. "
+        "During a fragment rerun, within a callback, displaying elements is not officially supported because "
+        "those elements will replace the existing elements at the top of your app."
+    )
 
 
 class DeltaGenerator(
     AlertMixin,
+    AudioInputMixin,
     BalloonsMixin,
-    BokehMixin,
     ButtonMixin,
+    ButtonGroupMixin,
     CameraInputMixin,
+    ChatMixin,
     CheckboxMixin,
+    CodeMixin,
     ColorPickerMixin,
     EmptyMixin,
     ExceptionMixin,
+    FeedbackMixin,
     FileUploaderMixin,
     FormMixin,
     GraphvizMixin,
     HeadingMixin,
     HelpMixin,
+    HtmlMixin,
     IframeMixin,
     ImageMixin,
     LayoutsMixin,
     MarkdownMixin,
     MapMixin,
     MediaMixin,
+    EChartsMixin,
+    MermaidChartMixin,
     MetricMixin,
+    MenuButtonMixin,
     MultiSelectMixin,
     NumberInputMixin,
+    PaginationMixin,
+    PdfMixin,
     PlotlyMixin,
     ProgressMixin,
     PydeckMixin,
@@ -153,20 +249,22 @@ class DeltaGenerator(
     RadioMixin,
     SelectboxMixin,
     SelectSliderMixin,
+    SkeletonMixin,
     SliderMixin,
     SnowMixin,
+    SpaceMixin,
+    SpinnerMixin,
+    TableMixin,
     JsonMixin,
     TextMixin,
     TextWidgetsMixin,
     TimeWidgetsMixin,
+    ToastMixin,
     WriteMixin,
     ArrowMixin,
-    ArrowAltairMixin,
-    ArrowVegaLiteMixin,
-    LegacyDataFrameMixin,
-    LegacyAltairMixin,
-    LegacyVegaLiteMixin,
-    DataFrameSelectorMixin,
+    VegaChartsMixin,
+    DataEditorMixin,
+    BidiComponentMixin,
 ):
     """Creator of Delta protobuf messages.
 
@@ -201,10 +299,10 @@ class DeltaGenerator(
     # those, see above.
     def __init__(
         self,
-        root_container: Optional[int] = RootContainer.MAIN,
-        cursor: Optional[Cursor] = None,
-        parent: Optional["DeltaGenerator"] = None,
-        block_type: Optional[str] = None,
+        root_container: int | None = RootContainer.MAIN,
+        cursor: Cursor | None = None,
+        parent: DeltaGenerator | None = None,
+        block_type: str | None = None,
     ) -> None:
         """Inserts or updates elements in Streamlit apps.
 
@@ -242,42 +340,36 @@ class DeltaGenerator(
         self._parent = parent
         self._block_type = block_type
 
-        # If this an `st.form` block, this will get filled in.
-        self._form_data: Optional[FormData] = None
+        # Tracks which fragment's scope created this container. Used to clear
+        # cached outside-write wrappers when that fragment reruns.
+        self._creating_fragment_id: str | None = None
 
-        # Change the module of all mixin'ed functions to be st.delta_generator,
-        # instead of the original module (e.g. st.elements.markdown)
-        for mixin in self.__class__.__bases__:
-            for (name, func) in mixin.__dict__.items():
-                if callable(func):
-                    func.__module__ = self.__module__
+        # If this an `st.form` block, this will get filled in.
+        self._form_data: FormData | None = None
 
     def __repr__(self) -> str:
         return util.repr_(self)
 
     def __enter__(self) -> None:
         # with block started
-        ctx = get_script_run_ctx()
-        if ctx:
-            ctx.dg_stack.append(self)
+        context_dg_stack.set((*context_dg_stack.get(), self))
 
     def __exit__(
         self,
-        type: Any,
-        value: Any,
-        traceback: Any,
+        typ: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
     ) -> Literal[False]:
         # with block ended
-        ctx = get_script_run_ctx()
-        if ctx is not None:
-            ctx.dg_stack.pop()
+
+        context_dg_stack.set(context_dg_stack.get()[:-1])
 
         # Re-raise any exceptions
         return False
 
     @property
-    def _active_dg(self) -> "DeltaGenerator":
-        """Return the DeltaGenerator that's currently 'active'.
+    def _active_dg(self) -> DeltaGenerator:
+        """The DeltaGenerator that's currently 'active'.
         If we are the main DeltaGenerator, and are inside a `with` block that
         creates a container, our active_dg is that container. Otherwise,
         our active_dg is self.
@@ -285,23 +377,24 @@ class DeltaGenerator(
         if self == self._main_dg:
             # We're being invoked via an `st.foo` pattern - use the current
             # `with` dg (aka the top of the stack).
-            ctx = get_script_run_ctx()
-            if ctx and len(ctx.dg_stack) > 0:
-                return ctx.dg_stack[-1]
+            last_context_stack_dg = get_last_dg_added_to_context_stack()
+            if last_context_stack_dg is not None:
+                return last_context_stack_dg
 
         # We're being invoked via an `st.sidebar.foo` pattern - ignore the
         # current `with` dg.
         return self
 
     @property
-    def _main_dg(self) -> "DeltaGenerator":
-        """Return this DeltaGenerator's root - that is, the top-level ancestor
+    def _main_dg(self) -> DeltaGenerator:
+        """The root DeltaGenerator - that is, the top-level ancestor
         DeltaGenerator that we belong to (this generally means the st._main
         DeltaGenerator).
         """
         return self._parent._main_dg if self._parent else self
 
-    def __getattr__(self, name: str) -> Callable[..., NoReturn]:
+    def _raise_for_unknown_command(self, name: str) -> Callable[..., NoReturn]:
+        """Return a callable that raises ``StreamlitAPIException`` for ``name``."""
         import streamlit as st
 
         streamlit_methods = [
@@ -311,54 +404,108 @@ class DeltaGenerator(
         def wrapper(*args: Any, **kwargs: Any) -> NoReturn:
             if name in streamlit_methods:
                 if self._root_container == RootContainer.SIDEBAR:
-                    message = (
-                        "Method `%(name)s()` does not exist for "
-                        "`st.sidebar`. Did you mean `st.%(name)s()`?" % {"name": name}
+                    raise StreamlitAPIException(
+                        f"Method `{name}()` does not exist for "
+                        f"`st.sidebar`. Did you mean `st.{name}()`?",
+                        error_id="sidebar-method-does-not-exist",
                     )
-                else:
-                    message = (
-                        "Method `%(name)s()` does not exist for "
-                        "`DeltaGenerator` objects. Did you mean "
-                        "`st.%(name)s()`?" % {"name": name}
-                    )
-            else:
-                message = "`%(name)s()` is not a valid Streamlit command." % {
-                    "name": name
-                }
-
-            raise StreamlitAPIException(message)
+                raise StreamlitAPIException(
+                    f"Method `{name}()` does not exist for "
+                    "`DeltaGenerator` objects. Did you mean "
+                    f"`st.{name}()`?",
+                    error_id="delta-generator-method-does-not-exist",
+                )
+            raise StreamlitAPIException(
+                f"`{name}()` is not a valid Streamlit command.",
+                error_id="invalid-streamlit-command",
+            )
 
         return wrapper
 
+    # Hide ``__getattr__`` from type checkers so unknown container methods such
+    # as ``st.sidebar.echo`` stay type errors. mypy only honors the unaliased
+    # ``TYPE_CHECKING`` name here; an alias makes those calls type-check.
+    if not TYPE_CHECKING:
+        __getattr__ = _raise_for_unknown_command
+
+    def __deepcopy__(self, _memo: Any) -> DeltaGenerator:
+        dg = DeltaGenerator(
+            root_container=self._root_container,
+            cursor=deepcopy(self._cursor),
+            parent=deepcopy(self._parent),
+            block_type=self._block_type,
+        )
+        dg._form_data = deepcopy(self._form_data)
+        dg._creating_fragment_id = self._creating_fragment_id
+        return dg
+
     @property
-    def _parent_block_types(self) -> Iterable[str]:
-        """Iterate all the block types used by this DeltaGenerator and all
-        its ancestor DeltaGenerators.
-        """
-        current_dg: Optional[DeltaGenerator] = self
+    def _ancestors(self) -> Iterable[DeltaGenerator]:
+        current_dg: DeltaGenerator | None = self
         while current_dg is not None:
-            if current_dg._block_type is not None:
-                yield current_dg._block_type
+            yield current_dg
             current_dg = current_dg._parent
 
     @property
-    def _cursor(self) -> Optional[Cursor]:
-        """Return our Cursor. This will be None if we're not running in a
+    def _ancestor_block_types(self) -> AncestorBlockTypes:
+        """Iterate all the block types used by this DeltaGenerator and all
+        its ancestor DeltaGenerators.
+        """
+        for a in self._ancestors:
+            if a._block_type is not None:
+                yield a._block_type
+
+    def _count_num_of_parent_columns(
+        self, ancestor_block_types: AncestorBlockTypes
+    ) -> int:
+        return sum(
+            1 for ancestor_block in ancestor_block_types if ancestor_block == "column"
+        )
+
+    @property
+    def _cursor(self) -> Cursor | None:
+        """Our Cursor. This will be None if we're not running in a
         ScriptThread - e.g., if we're running a "bare" script outside of
         Streamlit.
         """
         if self._provided_cursor is None:
             return cursor.get_container_cursor(self._root_container)
-        else:
-            return self._provided_cursor
+        return self._provided_cursor
 
     @property
     def _is_top_level(self) -> bool:
         return self._provided_cursor is None
 
     @property
-    def id(self) -> str:
+    def _block_delta_path(self) -> list[int]:
+        """The absolute delta path where `_block()` placed this block.
+
+        Only read this on a DeltaGenerator that `_block()` returned, whose cursor
+        `parent_path` is the block's own path. On a DeltaGenerator that `_enqueue()`
+        returned, the same expression gives the parent block's path instead.
+
+        `_block()` can redirect the write into layout-transparent wrapper blocks, which
+        places the block deeper than the parent cursor points to (see issue #16281).
+        Elements that re-send their own block proto later (`st.status`, `st.dialog`)
+        must therefore store this path instead of deriving it from the parent cursor.
+
+        The path is empty when there is no cursor, for example in bare mode.
+        """
+        own_cursor = self._cursor
+        if own_cursor is None:
+            return []
+        return [own_cursor.root_container, *own_cursor.parent_path]
+
+    @property
+    def _id(self) -> str:
         return str(id(self))
+
+    def _get_transient_cursor(self) -> cursor.Cursor:
+        cursor = self._active_dg._cursor
+        if cursor is None:
+            raise NoSessionContext("Cursor is not set")
+
+        return cursor.get_transient_cursor()
 
     def _get_delta_path_str(self) -> str:
         """Returns the element's delta path as a string like "[0, 2, 3, 1]".
@@ -374,135 +521,116 @@ class DeltaGenerator(
         dg = self._active_dg
         return str(dg._cursor.delta_path) if dg._cursor is not None else "[]"
 
-    @overload
-    def _enqueue(  # type: ignore[misc]
-        self,
-        delta_type: str,
-        element_proto: "Message",
-        return_value: None,
-        last_index: Optional[Hashable] = None,
-        element_width: Optional[int] = None,
-        element_height: Optional[int] = None,
-    ) -> "DeltaGenerator":
-        ...
+    def _get_write_delta_path_str(self) -> str:
+        """Return the delta path where this DeltaGenerator's next element is written.
 
-    @overload
-    def _enqueue(  # type: ignore[misc]
-        self,
-        delta_type: str,
-        element_proto: "Message",
-        return_value: Type[NoValue],
-        last_index: Optional[Hashable] = None,
-        element_width: Optional[int] = None,
-        element_height: Optional[int] = None,
-    ) -> None:
-        ...
-
-    @overload
-    def _enqueue(  # type: ignore[misc]
-        self,
-        delta_type: str,
-        element_proto: "Message",
-        return_value: Value,
-        last_index: Optional[Hashable] = None,
-        element_width: Optional[int] = None,
-        element_height: Optional[int] = None,
-    ) -> Value:
-        ...
-
-    @overload
-    def _enqueue(
-        self,
-        delta_type: str,
-        element_proto: "Message",
-        return_value: None = None,
-        last_index: Optional[Hashable] = None,
-        element_width: Optional[int] = None,
-        element_height: Optional[int] = None,
-    ) -> "DeltaGenerator":
-        ...
-
-    @overload
-    def _enqueue(
-        self,
-        delta_type: str,
-        element_proto: "Message",
-        return_value: Union[None, Type[NoValue], Value] = None,
-        last_index: Optional[Hashable] = None,
-        element_width: Optional[int] = None,
-        element_height: Optional[int] = None,
-    ) -> Union["DeltaGenerator", None, Value]:
-        ...
+        Unlike ``_get_delta_path_str``, this follows a fragment's write to a
+        container declared outside it into the wrapper block ``_enqueue``
+        redirects it to. The outside container's own cursor advances only once
+        for that wrapper, so it would give every such element the same path.
+        """
+        dg = self._active_dg
+        ctx = get_script_run_ctx()
+        if ctx is not None:
+            ts = ThreadState.get()
+            if ts.fragment_id and _needs_outside_wrapper(dg, ts, ctx.fragment_storage):
+                wrapper = ctx.fragment_storage.get_outside_wrapper(
+                    ts.fragment_id, dg._id
+                )
+                if wrapper is None:
+                    # `_enqueue` creates the wrapper at this cursor's position,
+                    # and the element becomes its first child.
+                    return str([*cast("Cursor", dg._cursor).delta_path, 0])
+                dg = wrapper.delta_generator
+        return str(dg._cursor.delta_path) if dg._cursor is not None else "[]"
 
     def _enqueue(
         self,
         delta_type: str,
-        element_proto: "Message",
-        return_value: Union[None, Type[NoValue], Value] = None,
-        last_index: Optional[Hashable] = None,
-        element_width: Optional[int] = None,
-        element_height: Optional[int] = None,
-    ) -> Union["DeltaGenerator", None, Value]:
+        element_proto: Message,
+        layout_config: LayoutConfig | None = None,
+        has_one_shot_effect: bool = False,
+        agent_props: str | None = None,
+    ) -> DeltaGenerator:
         """Create NewElement delta, fill it, and enqueue it.
 
         Parameters
         ----------
-        delta_type: string
+        delta_type : str
             The name of the streamlit method being called
-        element_proto: proto
+        element_proto : proto
             The actual proto in the NewElement type e.g. Alert/Button/Slider
-        return_value: any or None
-            The value to return to the calling script (for widgets)
-        element_width : int or None
-            Desired width for the element
-        element_height : int or None
-            Desired height for the element
+        agent_props : str or None
+            The command's description for the agent API, from
+            ``agent_spec.element``. ``None`` for every session the agent API
+            did not create, which is the normal case.
 
         Returns
         -------
-        DeltaGenerator or any
-            If this element is NOT an interactive widget, return a
-            DeltaGenerator that can be used to modify the newly-created
-            element. Otherwise, if the element IS a widget, return the
-            `return_value` parameter.
-
+        DeltaGenerator
+            Return a DeltaGenerator that can be used to modify the newly-created
+            element.
         """
         # Operate on the active DeltaGenerator, in case we're in a `with` block.
         dg = self._active_dg
-        # Warn if we're called from within a legacy @st.cache function
-        legacy_caching.maybe_show_cached_st_function_warning(dg, delta_type)
-        # Warn if we're called from within @st.memo or @st.singleton
-        caching.maybe_show_cached_st_function_warning(dg, delta_type)
+
+        ctx = get_script_run_ctx()
+        if ctx:
+            ts = ThreadState.get()
+            if ts.is_parallel_worker:
+                fragment_path = ts.delta_path
+                cursor_path = tuple(dg._cursor.delta_path) if dg._cursor else ()
+                # Empty fragment_path means the fragment's cursor was None; in that
+                # case _is_inside_fragment_path would always return True anyway, so
+                # skip the check.
+                if fragment_path and not _is_inside_fragment_path(
+                    cursor_path, fragment_path
+                ):
+                    raise StreamlitInvalidLayoutContextError(
+                        "Writing to a container created outside a parallel "
+                        "fragment, including `st.sidebar` and `st.bottom`, is "
+                        "not supported on a full app run or a later fragment "
+                        "rerun.\n\n"
+                        "To fix this, move the element inside the fragment body."
+                    )
+
+            if ts.fragment_id and _needs_outside_wrapper(dg, ts, ctx.fragment_storage):
+                dg = _get_or_create_outside_wrapper(dg, ts, ctx)
 
         # Warn if an element is being changed but the user isn't running the streamlit server.
-        st._maybe_print_use_warning()
-
-        # Some elements have a method.__name__ != delta_type in proto.
-        # This really matters for line_chart, bar_chart & area_chart,
-        # since add_rows() relies on method.__name__ == delta_type
-        # TODO: Fix for all elements (or the cache warning above will be wrong)
-        proto_type = delta_type
-        if proto_type in DELTA_TYPES_THAT_MELT_DATAFRAMES:
-            proto_type = "vega_lite_chart"
-
-        # Mirror the logic for arrow_ elements.
-        if proto_type in ARROW_DELTA_TYPES_THAT_MELT_DATAFRAMES:
-            proto_type = "arrow_vega_lite_chart"
+        _maybe_print_use_warning()
+        # Warn if an element is being changed during a fragment callback.
+        _maybe_print_fragment_callback_warning()
 
         # Copy the marshalled proto into the overall msg proto
-        msg = ForwardMsg_pb2.ForwardMsg()
-        msg_el_proto = getattr(msg.delta.new_element, proto_type)
+        msg = ForwardMsg()
+        msg_el_proto = getattr(msg.delta.new_element, delta_type)
         msg_el_proto.CopyFrom(element_proto)
+
+        if layout_config:
+            if layout_config.height is not None:
+                msg.delta.new_element.height_config.CopyFrom(
+                    get_height_config(layout_config.height)
+                )
+            if layout_config.width is not None:
+                msg.delta.new_element.width_config.CopyFrom(
+                    get_width_config(layout_config.width)
+                )
+            if layout_config.text_alignment is not None:
+                validate_text_alignment(layout_config.text_alignment)
+                msg.delta.new_element.text_alignment_config.CopyFrom(
+                    get_text_alignment_config(layout_config.text_alignment)
+                )
+
+        if has_one_shot_effect:
+            msg.delta.new_element.has_one_shot_effect = True
 
         # Only enqueue message and fill in metadata if there's a container.
         msg_was_enqueued = False
         if dg._root_container is not None and dg._cursor is not None:
             msg.metadata.delta_path[:] = dg._cursor.delta_path
-
-            if element_width is not None:
-                msg.metadata.element_dimension_spec.width = element_width
-            if element_height is not None:
-                msg.metadata.element_dimension_spec.height = element_height
+            if agent_props is not None:
+                msg.metadata.agent_props = agent_props
 
             _enqueue_message(msg)
             msg_was_enqueued = True
@@ -510,429 +638,321 @@ class DeltaGenerator(
         if msg_was_enqueued:
             # Get a DeltaGenerator that is locked to the current element
             # position.
-            new_cursor = (
-                dg._cursor.get_locked_cursor(
-                    delta_type=delta_type, last_index=last_index
-                )
-                if dg._cursor is not None
-                else None
-            )
+            new_cursor = dg._cursor.lock_element() if dg._cursor is not None else None
 
             output_dg = DeltaGenerator(
                 root_container=dg._root_container,
                 cursor=new_cursor,
                 parent=dg,
             )
+
+            # Elements inherit their parent form ids.
+            # NOTE: Form ids aren't set in dg constructor.
+            output_dg._form_data = FormData(current_form_id(dg))
         else:
             # If the message was not enqueued, just return self since it's a
             # no-op from the point of view of the app.
             output_dg = dg
 
-        # Save message for replay if we're called from within @st.memo or @st.singleton
+        # Save message for replay if we're called from within @st.cache_data or @st.cache_resource
         caching.save_element_message(
             delta_type,
             element_proto,
-            invoked_dg_id=self.id,
-            used_dg_id=dg.id,
-            returned_dg_id=output_dg.id,
+            invoked_dg_id=self._id,
+            used_dg_id=dg._id,
+            returned_dg_id=output_dg._id,
+            layout_config=layout_config,
+            agent_props=agent_props,
         )
 
-        return _value_or_dg(return_value, output_dg)
+        return output_dg
 
     def _block(
         self,
-        block_proto: Block_pb2.Block = Block_pb2.Block(),
-    ) -> "DeltaGenerator":
+        block_proto: Block_pb2.Block | None = None,
+        dg_type: type | None = None,
+        agent_props: str | None = None,
+    ) -> DeltaGenerator:
+        if block_proto is None:
+            block_proto = Block_pb2.Block()
+
         # Operate on the active DeltaGenerator, in case we're in a `with` block.
         dg = self._active_dg
 
         # Prevent nested columns & expanders by checking all parents.
         block_type = block_proto.WhichOneof("type")
-        # Convert the generator to a list, so we can use it multiple times.
-        parent_block_types = frozenset(dg._parent_block_types)
-        if block_type == "column" and block_type in parent_block_types:
-            raise StreamlitAPIException(
-                "Columns may not be nested inside other columns."
-            )
-        if block_type == "expandable" and block_type in parent_block_types:
-            raise StreamlitAPIException(
-                "Expanders may not be nested inside other expanders."
-            )
 
         if dg._root_container is None or dg._cursor is None:
+            # Without a script run context (for example, python app.py),
+            # return a fresh dg_type instance so subclass methods such as
+            # GridContainer.cell() work and nested containers don't share state.
+            if dg_type is not None:
+                return cast(
+                    "DeltaGenerator",
+                    dg_type(
+                        root_container=None,
+                        cursor=None,
+                        parent=dg,
+                        block_type=block_type,
+                    ),
+                )
             return dg
 
-        msg = ForwardMsg_pb2.ForwardMsg()
-        msg.metadata.delta_path[:] = dg._cursor.delta_path
-        msg.delta.add_block.CopyFrom(block_proto)
+        ctx = get_script_run_ctx()
+        ts = ThreadState.get() if ctx else None
+        if (
+            ctx is not None
+            and ts is not None
+            and ts.fragment_id
+            and _needs_outside_wrapper(dg, ts, ctx.fragment_storage)
+        ):
+            dg = _get_or_create_outside_wrapper(dg, ts, ctx)
 
-        # Normally we'd return a new DeltaGenerator that uses the locked cursor
-        # below. But in this case we want to return a DeltaGenerator that uses
-        # a brand new cursor for this new block we're creating.
-        block_cursor = cursor.RunningCursor(
-            root_container=dg._root_container,
-            parent_path=dg._cursor.parent_path + (dg._cursor.index,),
-        )
-        block_dg = DeltaGenerator(
-            root_container=dg._root_container,
-            cursor=block_cursor,
-            parent=dg,
-            block_type=block_type,
+        # Reassigning dg above drops the type narrowing from the None-guard.
+        parent_cursor = cast("Cursor", dg._cursor)
+        root_container = cast("int", dg._root_container)
+
+        # Snapshot delta_path before open_block() advances the parent cursor.
+        block_delta_path = list(parent_cursor.delta_path)
+
+        # Create a child cursor for this new block. open_block() also advances
+        # the parent cursor, so we capture delta_path above before this call.
+        block_cursor = parent_cursor.open_block()
+
+        # `dg_type` param added for st.status container. It allows us to
+        # instantiate DeltaGenerator subclasses from the function.
+        if dg_type is None:
+            dg_type = DeltaGenerator
+
+        block_dg = cast(
+            "DeltaGenerator",
+            dg_type(
+                root_container=root_container,
+                cursor=block_cursor,
+                parent=dg,
+                block_type=block_type,
+            ),
         )
         # Blocks inherit their parent form ids.
         # NOTE: Container form ids aren't set in proto.
         block_dg._form_data = FormData(current_form_id(dg))
+        block_dg._creating_fragment_id = ts.fragment_id if ts else None
 
-        # Must be called to increment this cursor's index.
-        dg._cursor.get_locked_cursor(last_index=None)
-        _enqueue_message(msg)
+        # open_block() already advanced the parent cursor, so we only emit here.
+        _enqueue_add_block(block_delta_path, block_proto, agent_props=agent_props)
 
         caching.save_block_message(
             block_proto,
-            invoked_dg_id=self.id,
-            used_dg_id=dg.id,
-            returned_dg_id=block_dg.id,
+            invoked_dg_id=self._id,
+            used_dg_id=dg._id,
+            returned_dg_id=block_dg._id,
+            agent_props=agent_props,
         )
 
         return block_dg
 
-    def _legacy_add_rows(
-        self: DG,
-        data: "Data" = None,
-        **kwargs: Union[
-            "DataFrame", "npt.NDArray[Any]", Iterable[Any], Dict[Hashable, Any], None
-        ],
-    ) -> Optional[DG]:
-        """Concatenate a dataframe to the bottom of the current one.
+    def _transient(
+        self,
+        element_proto: ElementProto,
+        layout_config: LayoutConfig | None = None,
+    ) -> tuple[ForwardMsgCreator, ForwardMsgCreator]:
+        """Provides the factory functions for creating and clearing transient elements.
+        It preserves the delta path, transient index, and the set of transient elements.
 
-        Parameters
-        ----------
-        data : pandas.DataFrame, pandas.Styler, numpy.ndarray, Iterable, dict,
-        or None
-            Table to concat. Optional.
-
-        **kwargs : pandas.DataFrame, numpy.ndarray, Iterable, dict, or None
-            The named dataset to concat. Optional. You can only pass in 1
-            dataset (including the one in the data parameter).
-
-        Example
-        -------
-        >>> df1 = pd.DataFrame(
-        ...    np.random.randn(50, 20),
-        ...    columns=('col %d' % i for i in range(20)))
-        ...
-        >>> my_table = st._legacy_table(df1)
-        >>>
-        >>> df2 = pd.DataFrame(
-        ...    np.random.randn(50, 20),
-        ...    columns=('col %d' % i for i in range(20)))
-        ...
-        >>> my_table._legacy_add_rows(df2)
-        >>> # Now the table shown in the Streamlit app contains the data for
-        >>> # df1 followed by the data for df2.
-
-        You can do the same thing with plots. For example, if you want to add
-        more data to a line chart:
-
-        >>> # Assuming df1 and df2 from the example above still exist...
-        >>> my_chart = st._legacy_line_chart(df1)
-        >>> my_chart._legacy_add_rows(df2)
-        >>> # Now the chart shown in the Streamlit app contains the data for
-        >>> # df1 followed by the data for df2.
-
-        And for plots whose datasets are named, you can pass the data with a
-        keyword argument where the key is the name:
-
-        >>> my_chart = st._legacy_vega_lite_chart({
-        ...     'mark': 'line',
-        ...     'encoding': {'x': 'a', 'y': 'b'},
-        ...     'datasets': {
-        ...       'some_fancy_name': df1,  # <-- named dataset
-        ...      },
-        ...     'data': {'name': 'some_fancy_name'},
-        ... }),
-        >>> my_chart._legacy_add_rows(some_fancy_name=df2)  # <-- name used as keyword
-
+        Returns a tuple of two functions:
+        - create_transient_element: Creates the new transient element.
+        - clear_transient_element: Clears the transient element.
         """
-        if self._root_container is None or self._cursor is None:
-            return self
+        transient_cursor = self._get_transient_cursor()
+        delta_path = transient_cursor.delta_path
+        transient_index = transient_cursor.transient_index
+        transient_elements = transient_cursor.transient_elements
 
-        if not self._cursor.is_locked:
-            raise StreamlitAPIException("Only existing elements can `add_rows`.")
-
-        # Accept syntax st._legacy_add_rows(df).
-        if data is not None and len(kwargs) == 0:
-            name = ""
-        # Accept syntax st._legacy_add_rows(foo=df).
-        elif len(kwargs) == 1:
-            name, data = kwargs.popitem()
-        # Raise error otherwise.
-        else:
-            raise StreamlitAPIException(
-                "Wrong number of arguments to add_rows()."
-                "Command requires exactly one dataset"
-            )
-
-        # When doing _legacy_add_rows on an element that does not already have data
-        # (for example, st._legacy_line_chart() without any args), call the original
-        # st._legacy_foo() element with new data instead of doing a _legacy_add_rows().
-        if (
-            self._cursor.props["delta_type"] in DELTA_TYPES_THAT_MELT_DATAFRAMES
-            and self._cursor.props["last_index"] is None
-        ):
-            # IMPORTANT: This assumes delta types and st method names always
-            # match!
-            # delta_type doesn't have any prefix, but st_method_name starts with "_legacy_".
-            st_method_name = "_legacy_" + self._cursor.props["delta_type"]
-            st_method = getattr(self, st_method_name)
-            st_method(data, **kwargs)
-            return None
-
-        data, self._cursor.props["last_index"] = _maybe_melt_data_for_add_rows(
-            data, self._cursor.props["delta_type"], self._cursor.props["last_index"]
-        )
-
-        msg = ForwardMsg_pb2.ForwardMsg()
-        msg.metadata.delta_path[:] = self._cursor.delta_path
-
-        import streamlit.elements.legacy_data_frame as data_frame
-
-        data_frame.marshall_data_frame(data, msg.delta.add_rows.data)
-
-        if name:
-            msg.delta.add_rows.name = name
-            msg.delta.add_rows.has_name = True
-
-        _enqueue_message(msg)
-
-        return self
-
-    def _arrow_add_rows(
-        self: DG,
-        data: "Data" = None,
-        **kwargs: Union[
-            "DataFrame", "npt.NDArray[Any]", Iterable[Any], Dict[Hashable, Any], None
-        ],
-    ) -> Optional[DG]:
-        """Concatenate a dataframe to the bottom of the current one.
-
-        Parameters
-        ----------
-        data : pandas.DataFrame, pandas.Styler, numpy.ndarray, Iterable, dict, or None
-            Table to concat. Optional.
-
-        **kwargs : pandas.DataFrame, numpy.ndarray, Iterable, dict, or None
-            The named dataset to concat. Optional. You can only pass in 1
-            dataset (including the one in the data parameter).
-
-        Example
-        -------
-        >>> df1 = pd.DataFrame(
-        ...    np.random.randn(50, 20),
-        ...    columns=('col %d' % i for i in range(20)))
-        ...
-        >>> my_table = st._arrow_table(df1)
-        >>>
-        >>> df2 = pd.DataFrame(
-        ...    np.random.randn(50, 20),
-        ...    columns=('col %d' % i for i in range(20)))
-        ...
-        >>> my_table._arrow_add_rows(df2)
-        >>> # Now the table shown in the Streamlit app contains the data for
-        >>> # df1 followed by the data for df2.
-
-        You can do the same thing with plots. For example, if you want to add
-        more data to a line chart:
-
-        >>> # Assuming df1 and df2 from the example above still exist...
-        >>> my_chart = st._arrow_line_chart(df1)
-        >>> my_chart._arrow_add_rows(df2)
-        >>> # Now the chart shown in the Streamlit app contains the data for
-        >>> # df1 followed by the data for df2.
-
-        And for plots whose datasets are named, you can pass the data with a
-        keyword argument where the key is the name:
-
-        >>> my_chart = st._arrow_vega_lite_chart({
-        ...     'mark': 'line',
-        ...     'encoding': {'x': 'a', 'y': 'b'},
-        ...     'datasets': {
-        ...       'some_fancy_name': df1,  # <-- named dataset
-        ...      },
-        ...     'data': {'name': 'some_fancy_name'},
-        ... }),
-        >>> my_chart._arrow_add_rows(some_fancy_name=df2)  # <-- name used as keyword
-
-        """
-        if self._root_container is None or self._cursor is None:
-            return self
-
-        if not self._cursor.is_locked:
-            raise StreamlitAPIException("Only existing elements can `add_rows`.")
-
-        # Accept syntax st._arrow_add_rows(df).
-        if data is not None and len(kwargs) == 0:
-            name = ""
-        # Accept syntax st._arrow_add_rows(foo=df).
-        elif len(kwargs) == 1:
-            name, data = kwargs.popitem()
-        # Raise error otherwise.
-        else:
-            raise StreamlitAPIException(
-                "Wrong number of arguments to add_rows()."
-                "Command requires exactly one dataset"
-            )
-
-        # When doing _arrow_add_rows on an element that does not already have data
-        # (for example, st._arrow_line_chart() without any args), call the original
-        # st._arrow_foo() element with new data instead of doing a _arrow_add_rows().
-        if (
-            self._cursor.props["delta_type"] in ARROW_DELTA_TYPES_THAT_MELT_DATAFRAMES
-            and self._cursor.props["last_index"] is None
-        ):
-            # IMPORTANT: This assumes delta types and st method names always
-            # match!
-            # delta_type starts with "arrow_", but st_method_name starts with "_arrow_".
-            st_method_name = "_" + self._cursor.props["delta_type"]
-            st_method = getattr(self, st_method_name)
-            st_method(data, **kwargs)
-            return None
-
-        data, self._cursor.props["last_index"] = _maybe_melt_data_for_add_rows(
-            data, self._cursor.props["delta_type"], self._cursor.props["last_index"]
-        )
-
-        msg = ForwardMsg_pb2.ForwardMsg()
-        msg.metadata.delta_path[:] = self._cursor.delta_path
-
-        import streamlit.elements.arrow as arrow_proto
-
-        default_uuid = str(hash(self._get_delta_path_str()))
-        arrow_proto.marshall(msg.delta.arrow_add_rows.data, data, default_uuid)
-
-        if name:
-            msg.delta.arrow_add_rows.name = name
-            msg.delta.arrow_add_rows.has_name = True
-
-        _enqueue_message(msg)
-
-        return self
-
-
-DFT = TypeVar("DFT", bound=type_util.DataFrameCompatible)
-
-
-def _maybe_melt_data_for_add_rows(
-    data: DFT,
-    delta_type: str,
-    last_index: Any,
-) -> Tuple[Union[DFT, "DataFrame"], Union[int, Any]]:
-    import pandas as pd
-
-    def _melt_data(
-        df: "DataFrame", last_index: Any
-    ) -> Tuple["DataFrame", Union[int, Any]]:
-        if isinstance(df.index, pd.RangeIndex):
-            old_step = _get_pandas_index_attr(df, "step")
-
-            # We have to drop the predefined index
-            df = df.reset_index(drop=True)
-
-            old_stop = _get_pandas_index_attr(df, "stop")
-
-            if old_step is None or old_stop is None:
-                raise StreamlitAPIException(
-                    "'RangeIndex' object has no attribute 'step'"
+        if layout_config:
+            if layout_config.height is not None:
+                element_proto.height_config.CopyFrom(
+                    get_height_config(layout_config.height)
+                )
+            if layout_config.width is not None:
+                element_proto.width_config.CopyFrom(
+                    get_width_config(layout_config.width)
                 )
 
-            start = last_index + old_step
-            stop = last_index + old_step + old_stop
+        # Revalidate the use of the lock here in the event
+        # better support threading/multiprocessing in Streamlit
+        transient_lock = threading.Lock()
 
-            df.index = pd.RangeIndex(start=start, stop=stop, step=old_step)
-            last_index = stop - 1
+        def create_transient_element() -> ForwardMsg:
+            with transient_lock:
+                transient_elements[transient_index] = element_proto
 
-        index_name = df.index.name
-        if index_name is None:
-            index_name = "index"
+                create_msg = ForwardMsg()
+                create_msg.metadata.delta_path[:] = delta_path
+                create_msg.metadata.cacheable = False
+                # Make sure the transient message is set as it will
+                # not be set if there are no transient elements
+                create_msg.delta.new_transient.SetInParent()
+                for e in transient_elements:
+                    create_msg.delta.new_transient.elements.add().CopyFrom(e)
 
-        df = pd.melt(df.reset_index(), id_vars=[index_name])
-        return df, last_index
+            return create_msg
 
-    # For some delta types we have to reshape the data structure
-    # otherwise the input data and the actual data used
-    # by vega_lite will be different, and it will throw an error.
-    if (
-        delta_type in DELTA_TYPES_THAT_MELT_DATAFRAMES
-        or delta_type in ARROW_DELTA_TYPES_THAT_MELT_DATAFRAMES
-    ):
-        if not isinstance(data, pd.DataFrame):
-            return _melt_data(
-                df=type_util.convert_anything_to_df(data),
-                last_index=last_index,
-            )
-        else:
-            return _melt_data(df=data, last_index=last_index)
+        def clear_transient_element() -> ForwardMsg:
+            with transient_lock:
+                if transient_index in transient_elements:
+                    del transient_elements[transient_index]
 
-    return data, last_index
+                clear_msg = ForwardMsg()
+                clear_msg.metadata.delta_path[:] = delta_path
+                clear_msg.metadata.cacheable = False
+                clear_msg.delta.new_transient.SetInParent()
+                for e in transient_elements:
+                    clear_msg.delta.new_transient.elements.add().CopyFrom(e)
 
+            return clear_msg
 
-def _get_pandas_index_attr(
-    data: "Union[DataFrame, Series]",
-    attr: str,
-) -> Optional[Any]:
-    return getattr(data.index, attr, None)
+        return create_transient_element, clear_transient_element
 
 
-@overload
-def _value_or_dg(value: None, dg: DG) -> DG:
-    ...
+def _is_inside_fragment_path(
+    cursor_path: tuple[int, ...],
+    fragment_path: tuple[int, ...],
+) -> bool:
+    """Check if cursor_path is within or equal to fragment_path."""
+    if len(cursor_path) < len(fragment_path):
+        return False
+    return cursor_path[: len(fragment_path)] == fragment_path
 
 
-@overload
-def _value_or_dg(value: Type[NoValue], dg: DG) -> None:  # type: ignore[misc]
-    ...
+def _enqueue_add_block(
+    delta_path: list[int],
+    block_proto: Block_pb2.Block,
+    agent_props: str | None = None,
+) -> None:
+    """Send an add_block ForwardMsg for `block_proto` at `delta_path`."""
+    msg = ForwardMsg()
+    msg.metadata.delta_path[:] = delta_path
+    if agent_props is not None:
+        msg.metadata.agent_props = agent_props
+    msg.delta.add_block.CopyFrom(block_proto)
+    _enqueue_message(msg)
 
 
-@overload
-def _value_or_dg(value: Value, dg: DG) -> Value:
-    # This overload definition technically overlaps with the one above (Value
-    # contains Type[NoValue]), and since the return types are conflicting,
-    # mypy complains. Hence, the ignore-comment above. But, in practice, since
-    # the overload above is more specific, and is matched first, there is no
-    # actual overlap. The `Value` type here is thus narrowed to the cases
-    # where value is neither None nor NoValue.
-
-    # The ignore-comment should thus be fine.
-    ...
-
-
-def _value_or_dg(
-    value: Union[None, Type[NoValue], Value],
-    dg: DG,
-) -> Union[DG, None, Value]:
-    """Return either value, or None, or dg.
-
-    This is needed because Widgets have meaningful return values. This is
-    unlike other elements, which always return None. Then we internally replace
-    that None with a DeltaGenerator instance.
-
-    However, sometimes a widget may want to return None, and in this case it
-    should not be replaced by a DeltaGenerator. So we have a special NoValue
-    object that gets replaced by None.
-
+def _needs_outside_wrapper(
+    dg: DeltaGenerator,
+    ts: FragmentThreadState,
+    fragment_storage: FragmentStorage,
+) -> bool:
+    """Return whether `dg` is a fragment writing to a container declared outside
+    its scope, and not already inside one of this fragment's wrappers.
     """
-    if value is NoValue:
-        return None
-    if value is None:
-        return dg
-    return cast(Value, value)
+    if ts.is_parallel_worker or not ts.fragment_id or not ts.delta_path:
+        return False
+
+    # Sidebar and bottom are shared containers — both the main script and
+    # fragments append to them, so a wrapper is needed to isolate the
+    # fragment's content. Main is unreachable here (fragments write into
+    # their own sub-container, not the root). Event containers are
+    # single-owner.
+    if dg._is_top_level:
+        return dg._root_container in {RootContainer.SIDEBAR, RootContainer.BOTTOM}
+
+    cursor_path = tuple(dg._cursor.delta_path) if dg._cursor else ()
+    if _is_inside_fragment_path(cursor_path, ts.delta_path):
+        return False
+
+    # If this DG is a descendant of a wrapper already created for this
+    # fragment, the write is already isolated — no additional wrapper needed.
+    wrapper_dg_ids = {
+        wrapper.delta_generator._id
+        for wrapper in fragment_storage.outside_wrappers_for(ts.fragment_id)
+    }
+    return all(ancestor._id not in wrapper_dg_ids for ancestor in dg._ancestors)
 
 
-def _enqueue_message(msg: ForwardMsg_pb2.ForwardMsg) -> None:
-    """Enqueues a ForwardMsg proto to send to the app."""
-    ctx = get_script_run_ctx()
+def _get_or_create_outside_wrapper(
+    dg: DeltaGenerator,
+    ts: FragmentThreadState,
+    ctx: ScriptRunContext,
+) -> DeltaGenerator:
+    """Return the cached wrapper DG, creating one on first write, or raise on a
+    standalone rerun that has no reserved slot.
+    """
+    fragment_storage = ctx.fragment_storage
+    fragment_id = cast("str", ts.fragment_id)
+    container_id = dg._id
 
-    if ctx is None:
-        raise NoSessionContext()
+    cached = fragment_storage.get_outside_wrapper(fragment_id, container_id)
+    if cached is not None:
+        return cached.delta_generator
 
-    ctx.enqueue(msg)
+    # fragment_ids_this_run is non-empty only during a standalone fragment
+    # rerun (not a full app rerun). If the container was created by one of
+    # the currently-running fragments, its cursor is valid and we can safely
+    # allocate a new wrapper (e.g. a child fragment writing into a container
+    # owned by its parent fragment during the parent's rerun). Otherwise the
+    # container's creating scope hasn't run, so we can't reserve a slot.
+    if ctx.fragment_ids_this_run and (
+        dg._creating_fragment_id not in ctx.fragment_ids_this_run
+    ):
+        raise StreamlitInvalidLayoutContextError(
+            "A fragment tried to write to a container created outside it, but "
+            "the fragment did not write to that container during the last full "
+            "app run, so Streamlit could not reserve a stable position for it.\n\n"
+            "If this fragment uses `parallel=True`, writing to containers "
+            "created outside it is not supported, including `st.sidebar` and "
+            "`st.bottom`. Move the element inside the fragment body.\n\n"
+            "Otherwise, inside the fragment function, write to the container "
+            "on every full app run (e.g. `outside_container.empty()` or "
+            "`with outside_container: st.empty()`), then fill it during "
+            "fragment reruns."
+        )
+
+    parent_cursor = cast("Cursor", dg._cursor)
+    root_container = cast("int", dg._root_container)
+    block_proto = Block_pb2.Block()
+    block_proto.transparent.SetInParent()
+    block_proto.allow_empty = True
+    # An internal wrapper with no public counterpart: its children belong to
+    # the container the author actually wrote to.
+    wrapper_agent_props = agent_spec.block("container", transparent=True)
+
+    creation_delta_path = list(parent_cursor.delta_path)
+
+    # Match the outside container's cursor type. st.empty() uses a LockedCursor,
+    # so the wrapper must also lock to preserve single-element semantics.
+    parent_path = (*parent_cursor.parent_path, parent_cursor.index)
+    if parent_cursor.is_locked:
+        wrapper_cursor: Cursor = cursor.LockedCursor(
+            root_container=root_container, parent_path=parent_path, index=0
+        )
+    else:
+        wrapper_cursor = cursor.RunningCursor(
+            root_container=root_container, parent_path=parent_path
+        )
+
+    wrapper_dg = DeltaGenerator(
+        root_container=root_container,
+        cursor=wrapper_cursor,
+        parent=dg,
+        block_type="transparent",
+    )
+
+    _enqueue_add_block(
+        creation_delta_path, block_proto, agent_props=wrapper_agent_props
+    )
+    # Advance the outside container's cursor exactly once, at creation time.
+    parent_cursor.lock_element()
+
+    fragment_storage.register_outside_wrapper(
+        fragment_id,
+        container_id,
+        OutsideContainerWrapper(
+            wrapper_dg,
+            creation_delta_path,
+            block_proto,
+            creating_fragment_id=dg._creating_fragment_id,
+            agent_props=wrapper_agent_props,
+        ),
+    )
+    return wrapper_dg

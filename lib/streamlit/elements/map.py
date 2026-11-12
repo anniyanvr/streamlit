@@ -1,4 +1,4 @@
-# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022)
+# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,37 +14,53 @@
 
 """A wrapper for simple PyDeck scatter charts."""
 
+from __future__ import annotations
+
 import copy
 import json
-from typing import Any, Dict, Iterable, Optional, Union, cast, TYPE_CHECKING
+import os
+from typing import TYPE_CHECKING, Any, Final, cast
 
-import pandas as pd
-from typing_extensions import Final, TypeAlias
-
-import streamlit.elements.deck_gl_json_chart as deck_gl_json_chart
+from streamlit import dataframe_util
+from streamlit.deprecation_util import (
+    make_deprecated_name_warning,
+    show_deprecation_warning,
+)
+from streamlit.elements import deck_gl_json_chart
+from streamlit.elements.lib import agent_data, agent_spec
+from streamlit.elements.lib.color_util import (
+    Color,
+    IntColorTuple,
+    is_color_like,
+    to_int_color_tuple,
+)
+from streamlit.elements.lib.layout_utils import (
+    HeightWithoutContent,
+    WidthWithoutContent,
+    create_layout_config,
+)
+from streamlit.elements.lib.utils import normalize_alt
 from streamlit.errors import StreamlitAPIException
 from streamlit.proto.DeckGlJsonChart_pb2 import DeckGlJsonChart as DeckGlJsonChartProto
 from streamlit.runtime.metrics_util import gather_metrics
 
 if TYPE_CHECKING:
-    from pandas.io.formats.style import Styler
+    from collections.abc import Collection
 
+    from pandas import DataFrame
+
+    from streamlit.dataframe_util import Data
     from streamlit.delta_generator import DeltaGenerator
 
-
-Data: TypeAlias = Union[
-    pd.DataFrame,
-    "Styler",
-    Iterable[Any],
-    Dict[Any, Any],
-    None,
-]
-
 # Map used as the basis for st.map.
-_DEFAULT_MAP: Final[Dict[str, Any]] = dict(deck_gl_json_chart.EMPTY_MAP)
+_DEFAULT_MAP: Final[dict[str, Any]] = dict(deck_gl_json_chart.EMPTY_MAP)
 
 # Other default parameters for st.map.
-_DEFAULT_COLOR: Final = [200, 30, 0, 160]
+_DEFAULT_LAT_COL_NAMES: Final = {"lat", "latitude", "LAT", "LATITUDE"}
+_DEFAULT_LON_COL_NAMES: Final = {"lon", "longitude", "LON", "LONGITUDE"}
+# The frontend resolves this placeholder to the theme primary color at alpha 160.
+_DEFAULT_COLOR: Final = "primary"
+_DEFAULT_SIZE: Final = 100
 _DEFAULT_ZOOM_LEVEL: Final = 12
 _ZOOM_LEVELS: Final = [
     360,
@@ -72,64 +88,449 @@ _ZOOM_LEVELS: Final = [
 
 
 class MapMixin:
-    @gather_metrics
+    @gather_metrics("map")
     def map(
         self,
         data: Data = None,
-        zoom: Optional[int] = None,
-        use_container_width: bool = True,
-    ) -> "DeltaGenerator":
-        """Display a map with points on it.
+        *,
+        latitude: str | None = None,
+        longitude: str | None = None,
+        color: str | Color | None = None,
+        size: str | float | None = None,
+        zoom: int | None = None,
+        width: WidthWithoutContent = "stretch",
+        height: HeightWithoutContent = 500,
+        use_container_width: bool | None = None,
+        alt: str | None = None,
+    ) -> DeltaGenerator:
+        """Display a map with a scatterplot overlaid onto it.
 
-        This is a wrapper around st.pydeck_chart to quickly create scatterplot
-        charts on top of a map, with auto-centering and auto-zoom.
+        This is a wrapper around ``st.pydeck_chart`` to quickly create
+        scatterplot charts on top of a map, with auto-centering and auto-zoom.
 
-        When using this command, we advise all users to use a personal Mapbox
-        token. This ensures the map tiles used in this chart are more
-        robust. You can do this with the mapbox.token config option.
+        When using this command, a service called Carto_ provides the map tiles to render
+        map content. If you're using advanced PyDeck features you may need to obtain
+        an API key from Carto first. You can do that as
+        ``pydeck.Deck(api_keys={"carto": YOUR_KEY})`` or by setting the CARTO_API_KEY
+        environment variable. See `PyDeck's documentation`_ for more information.
 
-        To get a token for yourself, create an account at
-        https://mapbox.com. It's free! (for moderate usage levels). For more
-        info on how to set config options, see
-        https://docs.streamlit.io/library/advanced-features/configuration#set-configuration-options
+        Another common provider for map tiles is Mapbox_. If you prefer to use that,
+        you'll need to create an account at https://mapbox.com and specify your Mapbox
+        key when creating the ``pydeck.Deck`` object. You can do that as
+        ``pydeck.Deck(api_keys={"mapbox": YOUR_KEY})`` or by setting the MAPBOX_API_KEY
+        environment variable.
+
+        .. _Carto: https://carto.com
+        .. _Mapbox: https://mapbox.com
+        .. _PyDeck's documentation: https://deckgl.readthedocs.io/en/latest/deck.html
+
+        Carto and Mapbox are third-party products and Streamlit accepts no responsibility
+        or liability of any kind for Carto or Mapbox, or for any content or information
+        made available by Carto or Mapbox. The use of Carto or Mapbox is governed by
+        their respective Terms of Use.
 
         Parameters
         ----------
-        data : pandas.DataFrame, pandas.Styler, numpy.ndarray, Iterable, dict,
-            or None
-            The data to be plotted. Must have columns called 'lat', 'lon',
-            'latitude', or 'longitude'.
+        data : Anything supported by st.dataframe
+            The data to be plotted.
+
+        latitude : str or None
+            The name of the column containing the latitude coordinates of
+            the datapoints in the chart.
+
+            If None, the latitude data will come from any column named 'lat',
+            'latitude', 'LAT', or 'LATITUDE'.
+
+        longitude : str or None
+            The name of the column containing the longitude coordinates of
+            the datapoints in the chart.
+
+            If None, the longitude data will come from any column named 'lon',
+            'longitude', 'LON', or 'LONGITUDE'.
+
+        color : str or tuple or None
+            The color of the circles representing each datapoint.
+
+            Can be:
+
+            - ``None`` (default): Markers use the theme primary color, partly
+              transparent so overlapping points stay visible. Customize it with
+              ``theme.primaryColor``.
+            - ``"primary"``: Same fill as ``None``. If the data has a column
+              named ``primary``, Streamlit colors the markers from that column
+              instead.
+            - A hex string like "#ffaa00" or "#ffaa0088".
+            - An RGB or RGBA tuple with the red, green, blue, and alpha
+              components specified as ints from 0 to 255 or floats from 0.0 to
+              1.0.
+            - The name of the column to use for the color. Cells in this column
+              should contain colors represented as a hex string or color tuple,
+              as described above.
+
+        size : str or float or None
+            The size of the circles representing each point, in meters.
+
+            This can be:
+
+            - None, to use the default size.
+            - A number like 100, to specify a single size to use for all
+              datapoints.
+            - The name of the column to use for the size. This allows each
+              datapoint to be represented by a circle of a different size.
+
         zoom : int
             Zoom level as specified in
-            https://wiki.openstreetmap.org/wiki/Zoom_levels
-        use_container_width: bool
+            https://wiki.openstreetmap.org/wiki/Zoom_levels.
 
-        Example
-        -------
-        >>> import streamlit as st
+        width : "stretch" or int
+            The width of the chart element. This can be one of the following:
+
+            - ``"stretch"`` (default): The width of the element matches the
+              width of the parent container.
+            - An integer specifying the width in pixels: The element has a
+              fixed width. If the specified width is greater than the width of
+              the parent container, the width of the element matches the width
+              of the parent container.
+
+        height : "stretch" or int
+            The height of the chart element. This can be one of the following:
+
+            - An integer specifying the height in pixels: The element has a
+              fixed height. If the content is larger than the specified
+              height, scrolling is enabled. This is ``500`` by default.
+            - ``"stretch"``: The height of the element matches the height of
+              its content or the height of the parent container, whichever is
+              larger. If the element is not in a parent container, the height
+              of the element matches the height of its content.
+
+        use_container_width : bool or None
+            Whether to override the map's native width with the width of
+            the parent container. This can be one of the following:
+
+            - ``None`` (default): Streamlit will use the map's default behavior.
+            - ``True``: Streamlit sets the width of the map to match the
+              width of the parent container.
+            - ``False``: Streamlit sets the width of the map to fit its
+              contents according to the plotting library, up to the width of
+              the parent container.
+
+            .. deprecated::
+               ``use_container_width`` is deprecated and will be removed in a
+                future release. For ``use_container_width=True``, use
+                ``width="stretch"``.
+
+        alt : str or None
+            A description of the map for screen readers and other assistive
+            technologies. If this is ``None`` (default), Streamlit does not
+            provide an accessible name for the map.
+
+            An empty or whitespace-only string is treated the same as ``None``
+            and is logged so authors notice the dual meaning of ``alt=""``
+            across commands (decorative only on ``st.image`` / ``st.pyplot``).
+
+            Keep this to a short description of the visual; it is not a full
+            text alternative for dense graphics.
+
+        Examples
+        --------
         >>> import pandas as pd
-        >>> import numpy as np
+        >>> import streamlit as st
+        >>> from numpy.random import default_rng as rng
         >>>
         >>> df = pd.DataFrame(
-        ...     np.random.randn(1000, 2) / [50, 50] + [37.76, -122.4],
-        ...     columns=['lat', 'lon'])
+        >>>     rng(0).standard_normal((1000, 2)) / [50, 50] + [37.76, -122.4],
+        >>>     columns=["lat", "lon"],
+        >>> )
         >>>
-        >>> st.map(df)
+        >>> st.map(df, alt="Sample points near San Francisco")
 
         .. output::
-           https://doc-map.streamlitapp.com/
-           height: 650px
+           https://doc-map.streamlit.app/
+           height: 600px
+
+        You can also customize the size and color of the datapoints:
+
+        >>> st.map(df, size=20, color="#0044ff")
+
+        And finally, you can choose different columns to use for the latitude
+        and longitude components, as well as set size and color of each
+        datapoint dynamically based on other columns:
+
+        >>> import pandas as pd
+        >>> import streamlit as st
+        >>> from numpy.random import default_rng as rng
+        >>>
+        >>> df = pd.DataFrame(
+        ...     {
+        ...         "col1": rng(0).standard_normal(1000) / 50 + 37.76,
+        ...         "col2": rng(1).standard_normal(1000) / 50 + -122.4,
+        ...         "col3": rng(2).standard_normal(1000) * 100,
+        ...         "col4": rng(3).standard_normal((1000, 4)).tolist(),
+        ...     }
+        ... )
+        >>>
+        >>> st.map(df, latitude="col1", longitude="col2", size="col3", color="col4")
+
+        .. output::
+           https://doc-map-color.streamlit.app/
+           height: 600px
 
         """
+        # Handle use_container_width deprecation (for elements that already had width parameter)
+        if use_container_width is not None:
+            show_deprecation_warning(
+                make_deprecated_name_warning(
+                    "use_container_width",
+                    "width",
+                    "2025-12-31",
+                    "For `use_container_width=True`, use `width='stretch'`. "
+                    "For `use_container_width=False`, specify an integer width.",
+                    include_st_prefix=False,
+                ),
+                show_in_browser=False,
+            )
+            if use_container_width:
+                width = "stretch"
+            # For use_container_width=False, preserve any integer width that was set.
+
+        layout_config = create_layout_config(width=width, height=height)
+
         map_proto = DeckGlJsonChartProto()
-        map_proto.json = to_deckgl_json(data, zoom)
-        map_proto.use_container_width = use_container_width
-        return self.dg._enqueue("deck_gl_json_chart", map_proto)
+        deck_gl_json = to_deckgl_json(data, latitude, longitude, size, color, zoom)
+
+        marshall(map_proto, deck_gl_json)
+
+        normalized_alt = normalize_alt(alt)
+        if normalized_alt is not None:
+            # st.map has no element ID today. Do not start hashing one just to include alt.
+            map_proto.alt = normalized_alt
+
+        return self.dg._enqueue(
+            "deck_gl_json_chart",
+            map_proto,
+            layout_config=layout_config,
+            # st.map and st.pydeck_chart share a proto. Size and color are the
+            # arguments the author passed; the generated Deck.gl spec is the
+            # map's data.
+            agent_props=agent_spec.element(
+                "map",
+                latitude=latitude,
+                longitude=longitude,
+                size=size,
+                color=color,
+                zoom=zoom,
+                alt=map_proto.alt or None,
+                data_builder=lambda: agent_data.raw_spec(map_proto.json),
+            ),
+        )
 
     @property
-    def dg(self) -> "DeltaGenerator":
-        """Get our DeltaGenerator."""
+    def dg(self) -> DeltaGenerator:
+        """The associated DeltaGenerator."""
         return cast("DeltaGenerator", self)
+
+
+def to_deckgl_json(
+    data: Data,
+    lat: str | None,
+    lon: str | None,
+    size: str | float | None,
+    color: str | Collection[float] | None,
+    zoom: int | None,
+) -> str:
+    """Serialize the map to a PyDeck JSON string."""
+    if data is None:
+        return json.dumps(_DEFAULT_MAP)
+
+    # TODO(harahu): iterables don't have the empty attribute. This is either
+    # a bug, or the documented data type is too broad. One or the other
+    # should be addressed
+    if hasattr(data, "empty") and data.empty:
+        return json.dumps(_DEFAULT_MAP)
+
+    df = dataframe_util.convert_anything_to_pandas_df(data)
+
+    lat_col_name = _get_lat_or_lon_col_name(df, "latitude", lat, _DEFAULT_LAT_COL_NAMES)
+    lon_col_name = _get_lat_or_lon_col_name(
+        df, "longitude", lon, _DEFAULT_LON_COL_NAMES
+    )
+    size_arg, size_col_name = _get_value_and_col_name(df, size, _DEFAULT_SIZE)
+    color_arg, color_col_name = _get_value_and_col_name(df, color, _DEFAULT_COLOR)
+
+    # Drop columns we're not using.
+    # (Sort for tests)
+    used_columns = sorted(
+        [
+            c
+            for c in {lat_col_name, lon_col_name, size_col_name, color_col_name}
+            if c is not None
+        ]
+    )
+    df = df[used_columns].copy()
+
+    converted_color_arg = _convert_color_arg_or_column(df, color_arg, color_col_name)
+
+    zoom, center_lat, center_lon = _get_viewport_details(
+        df, lat_col_name, lon_col_name, zoom
+    )
+
+    default = copy.deepcopy(_DEFAULT_MAP)
+    default["initialViewState"]["latitude"] = center_lat
+    default["initialViewState"]["longitude"] = center_lon
+    default["initialViewState"]["zoom"] = zoom
+    default["layers"] = [
+        {
+            "@@type": "ScatterplotLayer",
+            "getPosition": f"@@=[{lon_col_name}, {lat_col_name}]",
+            "getRadius": size_arg,
+            "radiusMinPixels": 3,
+            "radiusUnits": "meters",
+            "getFillColor": converted_color_arg,
+            "data": df.to_dict("records"),
+        }
+    ]
+
+    return json.dumps(default)
+
+
+def _get_lat_or_lon_col_name(
+    data: DataFrame,
+    human_readable_name: str,
+    col_name_from_user: str | None,
+    default_col_names: set[str],
+) -> str:
+    """Returns the column name to be used for latitude or longitude."""
+
+    if isinstance(col_name_from_user, str) and col_name_from_user in data.columns:
+        col_name = col_name_from_user
+
+    else:
+        # Try one of the default col_names:
+        candidate_col_name = None
+
+        for c in default_col_names:
+            if c in data.columns:
+                candidate_col_name = c
+                break
+
+        if candidate_col_name is None:
+            formatted_allowed_col_name = ", ".join(map(repr, sorted(default_col_names)))
+            formmated_col_names = ", ".join(map(repr, list(data.columns)))
+
+            raise StreamlitAPIException(
+                f"Map data must contain a {human_readable_name} column named: "
+                f"{formatted_allowed_col_name}. Existing columns: {formmated_col_names}",
+                error_id="map-missing-lat-lon-column",
+            )
+        col_name = candidate_col_name
+
+    # Check that the column is well-formed.
+    # IMPLEMENTATION NOTE: We can't use isnull().values.any() because .values can return
+    # ExtensionArrays, which don't have a .any() method.
+    # (Read about ExtensionArrays here: # https://pandas.pydata.org/community/blog/extension-arrays.html)
+    # However, after a performance test I found the solution below runs basically as
+    # fast as .values.any().
+    if any(data[col_name].isna().array):
+        raise StreamlitAPIException(
+            f"Column {col_name} is not allowed to contain null values, such "
+            "as NaN, NaT, or None.",
+            error_id="map-column-contains-nulls",
+        )
+
+    return col_name
+
+
+def _get_value_and_col_name(
+    data: DataFrame,
+    value_or_name: Any,
+    default_value: Any,
+) -> tuple[str, str | None]:
+    """Take a value_or_name passed in by the Streamlit developer and return a PyDeck
+    argument and column name for that property.
+
+    This is used for the size and color properties of the chart.
+
+    Example:
+    - If the user passes size=None, this returns the default size value and no column.
+    - If the user passes size=42, this returns 42 and no column.
+    - If the user passes size="my_col_123", this returns "@@=my_col_123" and "my_col_123".
+    """
+
+    pydeck_arg: str
+
+    if isinstance(value_or_name, str) and value_or_name in data.columns:
+        col_name = value_or_name
+        pydeck_arg = f"@@={col_name}"
+    else:
+        col_name = None
+
+        pydeck_arg = default_value if value_or_name is None else value_or_name
+
+    return pydeck_arg, col_name
+
+
+def _convert_color_arg_or_column(
+    data: DataFrame,
+    color_arg: str,
+    color_col_name: str | None,
+) -> str | IntColorTuple | None:
+    """Converts color to a format accepted by PyDeck.
+
+    For example:
+    - If color_arg is "#fff", then returns (255, 255, 255, 255).
+    - If color_col_name is "my_col_123", then it converts everything in column my_col_123 to
+      an accepted color format such as (0, 100, 200, 255).
+
+    NOTE: This function mutates the data argument.
+    """
+
+    color_arg_out: str | IntColorTuple | None = None
+
+    if color_col_name is not None:
+        # Convert color column to the right format.
+        if len(data[color_col_name]) > 0 and is_color_like(data[color_col_name].iat[0]):
+            # Convert to object dtype first to support tuple values (pandas 3.x infers
+            # string columns as StringDtype which can't hold tuples).
+            data[color_col_name] = data[color_col_name].astype(object)
+            data[color_col_name] = data[color_col_name].map(to_int_color_tuple)
+        else:
+            raise StreamlitAPIException(
+                f'Column "{color_col_name}" does not appear to contain valid colors.',
+                error_id="map-invalid-color-column",
+            )
+
+        color_arg_out = color_arg
+
+    elif color_arg is not None:
+        # "primary" is a placeholder that the frontend resolves to
+        # theme.colors.primary at a fixed marker alpha. Other values are
+        # converted to Deck.gl int color tuples here.
+        if isinstance(color_arg, str) and color_arg.lower() == "primary":
+            color_arg_out = "primary"
+        else:
+            color_arg_out = to_int_color_tuple(color_arg)
+
+    return color_arg_out
+
+
+def _get_viewport_details(
+    data: DataFrame, lat_col_name: str, lon_col_name: str, zoom: int | None
+) -> tuple[int, float, float]:
+    """Auto-set viewport when not fully specified by user."""
+    min_lat = data[lat_col_name].min()
+    max_lat = data[lat_col_name].max()
+    min_lon = data[lon_col_name].min()
+    max_lon = data[lon_col_name].max()
+    center_lat = (max_lat + min_lat) / 2.0
+    center_lon = (max_lon + min_lon) / 2.0
+    range_lon = abs(max_lon - min_lon)
+    range_lat = abs(max_lat - min_lat)
+
+    if zoom is None:
+        longitude_distance = max(range_lat, range_lon)
+        zoom = _get_zoom_level(longitude_distance)
+
+    return zoom, center_lat, center_lon
 
 
 def _get_zoom_level(distance: float) -> int:
@@ -156,79 +557,21 @@ def _get_zoom_level(distance: float) -> int:
     return _DEFAULT_ZOOM_LEVEL
 
 
-def to_deckgl_json(data: Data, zoom: Optional[int]) -> str:
-    # TODO(harahu): The ignore statement here is because iterables don't have
-    #  the empty attribute. This is either a bug, or the documented data type
-    #  is too broad. One or the other should be addressed, and the ignore
-    #  statement removed.
-    if data is None or data.empty:  # type: ignore[union-attr]
-        return json.dumps(_DEFAULT_MAP)
+def marshall(
+    pydeck_proto: DeckGlJsonChartProto,
+    pydeck_json: str,
+) -> None:
+    """Marshall a map proto with the given pydeck JSON specification.
 
-    if "lat" in data:
-        lat = "lat"
-    elif "latitude" in data:
-        lat = "latitude"
-    else:
-        raise StreamlitAPIException(
-            'Map data must contain a column named "latitude" or "lat".'
-        )
+    Layout configuration (width, height, etc.) is handled by the LayoutConfig
+    system and not through proto fields.
+    """
+    pydeck_proto.json = pydeck_json
+    pydeck_proto.id = ""
 
-    if "lon" in data:
-        lon = "lon"
-    elif "longitude" in data:
-        lon = "longitude"
-    else:
-        raise StreamlitAPIException(
-            'Map data must contain a column called "longitude" or "lon".'
-        )
-
-    # TODO(harahu): The ignore statement here is because iterables don't have
-    #  the empty attribute. This is either a bug, or the documented data type
-    #  is too broad. One or the other should be addressed, and the ignore
-    #  statement removed.
-    if data[lon].isnull().values.any() or data[lat].isnull().values.any():  # type: ignore[index]
-        raise StreamlitAPIException("Latitude and longitude data must be numeric.")
-
-    data = pd.DataFrame(data)
-
-    min_lat = data[lat].min()
-    max_lat = data[lat].max()
-    min_lon = data[lon].min()
-    max_lon = data[lon].max()
-    center_lat = (max_lat + min_lat) / 2.0
-    center_lon = (max_lon + min_lon) / 2.0
-    range_lon = abs(max_lon - min_lon)
-    range_lat = abs(max_lat - min_lat)
-
-    if zoom is None:
-        if range_lon > range_lat:
-            longitude_distance = range_lon
-        else:
-            longitude_distance = range_lat
-        zoom = _get_zoom_level(longitude_distance)
-
-    # "+1" because itertuples includes the row index.
-    lon_col_index = data.columns.get_loc(lon) + 1
-    lat_col_index = data.columns.get_loc(lat) + 1
-    final_data = []
-    for row in data.itertuples():
-        final_data.append(
-            {"lon": float(row[lon_col_index]), "lat": float(row[lat_col_index])}
-        )
-
-    default = copy.deepcopy(_DEFAULT_MAP)
-    default["initialViewState"]["latitude"] = center_lat
-    default["initialViewState"]["longitude"] = center_lon
-    default["initialViewState"]["zoom"] = zoom
-    default["layers"] = [
-        {
-            "@@type": "ScatterplotLayer",
-            "getPosition": "@@=[lon, lat]",
-            "getRadius": 10,
-            "radiusScale": 10,
-            "radiusMinPixels": 3,
-            "getFillColor": _DEFAULT_COLOR,
-            "data": final_data,
-        }
-    ]
-    return json.dumps(default)
+    # st.map builds Deck JSON itself and never constructs a PyDeck Deck, so
+    # copy MAPBOX_API_KEY onto the proto. Default styles are Carto; the
+    # frontend uses this token only if the spec selects a Mapbox style.
+    mapbox_token = os.environ.get("MAPBOX_API_KEY")
+    if mapbox_token:
+        pydeck_proto.mapbox_token = mapbox_token

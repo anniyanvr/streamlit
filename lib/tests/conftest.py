@@ -1,4 +1,4 @@
-# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022)
+# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,9 +17,32 @@ Global pytest fixtures. This file is automatically run by pytest before tests
 are executed.
 """
 
-from unittest.mock import patch, mock_open
-import os
+from __future__ import annotations
+
+import contextlib
 import logging
+import os
+from typing import TYPE_CHECKING, Final
+from unittest.mock import mock_open, patch
+
+import pytest
+from coverage import inorout as coverage_inorout
+
+if TYPE_CHECKING:
+    from streamlit.runtime.pages_manager import PagesManager
+
+_LOGGER: Final = logging.getLogger(__name__)
+
+# Whenever `sys.path` changes, as it does when a test's script run adds the
+# script's folder, coverage.py looks up its `source` packages again inside
+# `sys_modules_saved()`. On exit, that removes every module added to
+# `sys.modules` in the meantime by any thread, including a module another
+# thread is still importing, whose import then fails with a `KeyError` naming
+# it (https://github.com/coveragepy/coveragepy/issues/2247). The removal only
+# undoes the parent packages that looking up a dotted package name imports.
+# Looking up the top-level `streamlit` package imports nothing, so there is
+# nothing to undo. Remove this once coverage.py releases a fix.
+coverage_inorout.sys_modules_saved = contextlib.nullcontext
 
 # Do not import any Streamlit modules here! See below for details.
 
@@ -33,22 +56,25 @@ unitTest = true
 gatherUsageStats = false
 """
 
-with patch(
-    "streamlit.config.open", mock_open(read_data=CONFIG_FILE_CONTENTS), create=True
-), patch("streamlit.config.os.path.exists") as path_exists:
+with (
+    patch(
+        "streamlit.config.open", mock_open(read_data=CONFIG_FILE_CONTENTS), create=True
+    ),
+    patch("streamlit.config.os.path.exists") as path_exists,
+):
     # Import streamlit even if we don't do anything with it below as we want to
     # be sure to catch any instances of calling config.get_option() when
     # first importing a file. We disallow this because doing so means that we
     # miss config options set via flag or environment variable.
-    import streamlit as st
+    import streamlit as st  # noqa: F401
+    from streamlit import config, file_util
 
-    from streamlit import config
-    from streamlit import file_util
-    from streamlit import source_util
-
-    assert (
-        not config._config_options
-    ), "config.get_option() should not be called on file import!"
+    if config._config_options:
+        _LOGGER.warning(
+            "The config options have been populated already. This can happen if there "
+            "is a config file in a supported path. This can lead to unreliable test "
+            "execution."
+        )
 
     config_path = file_util.get_streamlit_file_path("config.toml")
     path_exists.side_effect = lambda path: path == config_path
@@ -57,20 +83,110 @@ with patch(
     # result gets cached.
     config.get_config_options(force_reparse=True)
 
-    # Set source_util._cached_pages to the empty dict below so that
-    # source_util.get_pages' behavior is deterministic and doesn't depend on the
-    # filesystem of the machine tests are being run on. Tests that need
-    # source_util.get_pages to depend on the filesystem can patch this value
-    # back to None.
-    source_util._cached_pages = {}
+
+def pytest_addoption(parser: pytest.Parser):
+    group = parser.getgroup("streamlit")
+
+    group.addoption(
+        "--require-integration",
+        action="store_true",
+        help="only run integration tests. ",
+    )
 
 
-def pytest_sessionfinish():
-    # We're not waiting for scriptrunner threads to cleanly close before ending the PyTest,
-    # which results in raised exception ValueError: I/O operation on closed file.
-    # This is well known issue in PyTest, check out these discussions for more:
-    # * https://github.com/pytest-dev/pytest/issues/5502
-    # * https://github.com/pytest-dev/pytest/issues/5282
-    # To prevent the exception from being raised on pytest_sessionfinish
-    # we disable exception raising in logging module
-    logging.raiseExceptions = False
+def pytest_configure(config: pytest.Config):
+    config.addinivalue_line(
+        "markers",
+        "require_integration(name): mark test to run only on "
+        "when --require-integration option is passed to pytest",
+    )
+
+    is_require_integration = config.getoption("--require-integration", default=False)
+    if is_require_integration:
+        try:
+            import snowflake.snowpark  # noqa: F401
+        except ImportError:
+            raise pytest.UsageError(
+                "The snowflake-snowpark-python package is not installed."
+            )
+
+
+def pytest_runtest_setup(item: pytest.Item):
+    from streamlit.runtime.pages_manager import PagesManager
+
+    # Ensure the pages directory feature is not set prior to the test
+    PagesManager.uses_pages_directory = None
+
+    is_require_integration = item.config.getoption(
+        "--require-integration", default=False
+    )
+    has_require_integration_marker = bool(
+        list(item.iter_markers(name="require_integration"))
+    )
+
+    if is_require_integration and not has_require_integration_marker:
+        pytest.skip(
+            f"The test is skipped because it has require_integration marker. "
+            f"This tests are only run when --require-integration flag is passed to pytest. "
+            f"{item}"
+        )
+    if not is_require_integration and has_require_integration_marker:
+        pytest.skip(
+            f"The test is skipped because it does not have the right marker. "
+            f"Only tests marked with pytest.mark.require_integration() are run. {item}"
+        )
+
+
+def pytest_collection_modifyitems(config, items):
+    """
+    Adds the `@pytest.mark.benchmark` marker to tests that use the `benchmark`
+    fixture. This marker allows us to run only performance tests when needed.
+    """
+    for item in items:
+        markers = item.get_closest_marker("usefixtures")
+        if markers and "benchmark" in markers.args:
+            item.add_marker(pytest.mark.performance)
+
+
+@pytest.fixture
+def anyio_backend() -> str:
+    """Pin `@pytest.mark.anyio` tests to the asyncio backend."""
+    # Streamlit only runs on asyncio. Without this pin, the anyio pytest plugin
+    # parametrizes tests over undeclared backends (like trio), which causes
+    # errors in the minimum-dependency test environment.
+    return "asyncio"
+
+
+@pytest.fixture
+def benchmark(
+    benchmark,
+    request: pytest.FixtureRequest,
+):
+    # Check to see that the test has the @pytest.mark.performance mark
+    if not request.node.get_closest_marker("performance"):
+        raise ValueError(
+            "The benchmark fixture can only be used with tests marked with @pytest.mark.performance"
+        )
+
+    # If the request is a class, add benchmark to the class so that it can be
+    # accessed via `self.benchmark()`. This is most commonly used in unittest
+    # classes.
+    if request.cls:
+        request.cls.benchmark = benchmark
+
+    # For pytest functions, return the benchmark function so that it can be
+    # accessed via the fixture.
+    return benchmark
+
+
+def enable_mpa_v2_mode(pages_manager: PagesManager) -> None:
+    """Enable MPA v2 mode on a PagesManager for test setup.
+
+    In MPA v1 (legacy), pages are auto-discovered from a ``pages/`` directory.
+    In MPA v2, pages are explicitly set via ``st.navigation()``. The distinction
+    is signaled by ``_pages`` being non-None (even if empty).
+
+    This helper documents the intent when tests need MPA v2 mode as a
+    precondition, without testing PagesManager functionality itself.
+    """
+    pages_manager._set_pages({})

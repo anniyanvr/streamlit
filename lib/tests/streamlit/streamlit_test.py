@@ -1,4 +1,4 @@
-# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022)
+# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,39 +14,79 @@
 
 """Streamlit Unit test."""
 
-import json
-import logging
+from __future__ import annotations
+
 import os
 import re
+import statistics
+import subprocess
 import sys
-import textwrap
-import time
+import tempfile
+import tomllib
 import unittest
-from unittest.mock import patch
 
-import numpy as np
-import pandas as pd
-from google.protobuf import json_format
-from parameterized import parameterized
+import matplotlib as mpl
+import pytest
 
 import streamlit as st
 from streamlit import __version__
-from streamlit.errors import StreamlitAPIException
-from streamlit.logger import get_logger
-from streamlit.proto.Alert_pb2 import Alert
-from streamlit.proto.Empty_pb2 import Empty as EmptyProto
-from tests import testutil
+from tests.streamlit.element_mocks import (
+    CONTAINER_ELEMENTS,
+    NON_WIDGET_ELEMENTS,
+    WIDGET_ELEMENTS,
+)
 
 
-def get_version():
-    """Get version by parsing out setup.py."""
+def get_version() -> str | None:
+    """Get version by parsing pyproject.toml."""
     dirname = os.path.dirname(__file__)
     base_dir = os.path.abspath(os.path.join(dirname, "../.."))
-    pattern = re.compile(r"(?:.*VERSION = \")(?P<version>.*)(?:\"  # PEP-440$)")
-    for line in open(os.path.join(base_dir, "setup.py")).readlines():
-        m = pattern.match(line)
-        if m:
-            return m.group("version")
+    pyproject_path = os.path.join(base_dir, "pyproject.toml")
+
+    with open(pyproject_path, "rb") as f:
+        pyproject = tomllib.load(f)
+
+    return pyproject.get("project", {}).get("version")
+
+
+# Commands that don't result in rendered elements in the frontend
+NON_ELEMENT_COMMANDS: set[str] = {
+    "App",
+    "Page",
+    "bottom",
+    "cache_data",
+    "cache_resource",
+    "connection",
+    "context",
+    "fragment",
+    "get_option",
+    "login",
+    "logout",
+    "navigation",
+    "query_params",
+    "rerun",
+    "secrets",
+    "session_state",
+    "set_option",
+    "set_page_config",
+    "sidebar",
+    "stop",
+    "switch_page",
+    "user",
+}
+
+# Element commands that are exposed on the DeltaGenerator
+# and on the top-level Streamlit namespace.
+# We extract them from the element mocks.
+ELEMENT_COMMANDS: set[str] = {
+    command for command, _ in WIDGET_ELEMENTS + NON_WIDGET_ELEMENTS + CONTAINER_ELEMENTS
+}
+
+# Public commands intentionally omitted from the api-reference.md skill doc
+# (e.g. internal commands not meant for app authors). Add a command here only
+# if it should stay out of the reference; deprecated commands are still
+# documented (with a deprecation note), so they don't belong in this set.
+API_REFERENCE_EXCLUSIONS: set[str] = set()
 
 
 class StreamlitTest(unittest.TestCase):
@@ -54,578 +94,215 @@ class StreamlitTest(unittest.TestCase):
 
     def test_streamlit_version(self):
         """Test streamlit.__version__."""
-        self.assertEqual(__version__, get_version())
+        assert __version__ == get_version()
 
     def test_get_option(self):
         """Test streamlit.get_option."""
         # This is set in lib/tests/conftest.py to False
-        self.assertEqual(False, st.get_option("browser.gatherUsageStats"))
+        assert not st.get_option("browser.gatherUsageStats")
 
-    def test_set_option_scriptable(self):
-        """Test that scriptable options can be set from API."""
-        # This is set in lib/tests/conftest.py to off
-        self.assertEqual(True, st.get_option("client.displayEnabled"))
+    def test_matplotlib_uses_agg(self):
+        """Test that Streamlit uses the 'Agg' backend for matplotlib."""
+        ORIG_PLATFORM = sys.platform
 
-        try:
-            # client.displayEnabled and client.caching can be set after run starts.
-            st.set_option("client.displayEnabled", False)
-            self.assertEqual(False, st.get_option("client.displayEnabled"))
-        finally:
-            # Restore original value
-            st.set_option("client.displayEnabled", True)
+        for platform in ["darwin", "linux2"]:
+            sys.platform = platform
 
-    def test_set_option_unscriptable(self):
-        """Test that unscriptable options cannot be set with st.set_option."""
-        # This is set in lib/tests/conftest.py to off
-        self.assertEqual(True, st.get_option("server.enableCORS"))
+            assert mpl.get_backend().lower() == "agg"
+            assert os.environ.get("MPLBACKEND").lower() == "agg"
 
-        with self.assertRaises(StreamlitAPIException):
-            st.set_option("server.enableCORS", False)
+            # Force matplotlib to use a different backend
+            mpl.use("pdf", force=True)
+            assert mpl.get_backend().lower() == "pdf"
 
-    def test_run_warning_presence(self):
-        """Using Streamlit without `streamlit run` produces a warning."""
-        with self.assertLogs(level=logging.WARNING) as logs:
-            st._is_running_with_streamlit = False
-            st._use_warning_has_been_displayed = False
-            st.write("Using delta generator")
-            output = "".join(logs.output)
-            # Warning produced exactly once
-            self.assertEqual(len(re.findall(r"streamlit run", output)), 1)
+            # Reset the backend to 'Agg'
+            mpl.use("agg", force=True)
+            assert mpl.get_backend().lower() == "agg"
+        sys.platform = ORIG_PLATFORM
 
-    def test_run_warning_absence(self):
-        """Using Streamlit through the CLI produces no usage warning."""
-        with self.assertLogs(level=logging.WARNING) as logs:
-            st._is_running_with_streamlit = True
-            st._use_warning_has_been_displayed = False
-            st.write("Using delta generator")
-            # assertLogs is being used as a context manager, but it also checks that some log output was captured, so we have to let it capture something
-            get_logger("root").warning("irrelevant warning so assertLogs passes")
-            self.assertNotRegex("".join(logs.output), r"streamlit run")
+    def test_ensure_completeness_element_mocks(self):
+        """Test that we have mocked all elements in the public API.
 
-
-class StreamlitAPITest(testutil.DeltaGeneratorTestCase):
-    """Test Public Streamlit Public APIs."""
-
-    def test_st_legacy_altair_chart(self):
-        """Test st._legacy_altair_chart."""
-        import altair as alt
-
-        df = pd.DataFrame(np.random.randn(3, 3), columns=["a", "b", "c"])
-
-        c = (
-            alt.Chart(df)
-            .mark_circle()
-            .encode(x="a", y="b", size="c", color="c")
-            .interactive()
-        )
-        st._legacy_altair_chart(c)
-
-        el = self.get_delta_from_queue().new_element
-        spec = json.loads(el.vega_lite_chart.spec)
-
-        # Checking Vega-Lite is a lot of work so rather than doing that, we
-        # just checked to see if the spec data name matches the dataset.
-        self.assertEqual(
-            spec.get("data").get("name"), el.vega_lite_chart.datasets[0].name
-        )
-
-    def test_st_arrow_altair_chart(self):
-        """Test st._arrow_altair_chart."""
-        import altair as alt
-
-        df = pd.DataFrame(np.random.randn(3, 3), columns=["a", "b", "c"])
-
-        c = (
-            alt.Chart(df)
-            .mark_circle()
-            .encode(x="a", y="b", size="c", color="c")
-            .interactive()
-        )
-        st._arrow_altair_chart(c)
-
-        proto = self.get_delta_from_queue().new_element.arrow_vega_lite_chart
-        spec = json.loads(proto.spec)
-
-        # Checking Vega-Lite is a lot of work so rather than doing that, we
-        # just checked to see if the spec data name matches the dataset.
-        self.assertEqual(spec.get("data").get("name"), proto.datasets[0].name)
-
-    def test_st_legacy_area_chart(self):
-        """Test st._legacy_area_chart."""
-        df = pd.DataFrame([[10, 20, 30]], columns=["a", "b", "c"])
-        st._legacy_area_chart(df, width=640, height=480)
-
-        el = self.get_delta_from_queue().new_element.vega_lite_chart
-        chart_spec = json.loads(el.spec)
-        self.assertEqual(chart_spec["mark"], "area")
-        self.assertEqual(chart_spec["width"], 640)
-        self.assertEqual(chart_spec["height"], 480)
-        self.assertEqual(
-            el.datasets[0].data.columns.plain_index.data.strings.data,
-            ["index", "variable", "value"],
-        )
-
-        data = json.loads(json_format.MessageToJson(el.datasets[0].data.data))
-        result = [x["int64s"]["data"] for x in data["cols"] if "int64s" in x]
-        self.assertEqual(result[1], ["10", "20", "30"])
-
-    def test_st_arrow_area_chart(self):
-        """Test st._arrow_area_chart."""
-        from streamlit.type_util import bytes_to_data_frame
-
-        df = pd.DataFrame([[10, 20, 30]], columns=["a", "b", "c"])
-        EXPECTED_DATAFRAME = pd.DataFrame(
-            [[0, "a", 10], [0, "b", 20], [0, "c", 30]],
-            index=[0, 1, 2],
-            columns=["index", "variable", "value"],
-        )
-        st._arrow_area_chart(df, width=640, height=480)
-
-        proto = self.get_delta_from_queue().new_element.arrow_vega_lite_chart
-        chart_spec = json.loads(proto.spec)
-
-        self.assertEqual(chart_spec["mark"], "area")
-        self.assertEqual(chart_spec["width"], 640)
-        self.assertEqual(chart_spec["height"], 480)
-        pd.testing.assert_frame_equal(
-            bytes_to_data_frame(proto.datasets[0].data.data),
-            EXPECTED_DATAFRAME,
-        )
-
-    def test_st_balloons(self):
-        """Test st.balloons."""
-        st.balloons()
-        el = self.get_delta_from_queue().new_element
-        self.assertEqual(el.balloons.show, True)
-
-    def test_st_legacy_bar_chart(self):
-        """Test st._legacy_bar_chart."""
-        df = pd.DataFrame([[10, 20, 30]], columns=["a", "b", "c"])
-
-        st._legacy_bar_chart(df, width=640, height=480)
-
-        el = self.get_delta_from_queue().new_element.vega_lite_chart
-        chart_spec = json.loads(el.spec)
-        self.assertEqual(chart_spec["mark"], "bar")
-        self.assertEqual(chart_spec["width"], 640)
-        self.assertEqual(chart_spec["height"], 480)
-        self.assertEqual(
-            el.datasets[0].data.columns.plain_index.data.strings.data,
-            ["index", "variable", "value"],
-        )
-
-        data = json.loads(json_format.MessageToJson(el.datasets[0].data.data))
-        result = [x["int64s"]["data"] for x in data["cols"] if "int64s" in x]
-
-        self.assertEqual(result[1], ["10", "20", "30"])
-
-    def test_st_arrow_bar_chart(self):
-        """Test st._arrow_bar_chart."""
-        from streamlit.type_util import bytes_to_data_frame
-
-        df = pd.DataFrame([[10, 20, 30]], columns=["a", "b", "c"])
-        EXPECTED_DATAFRAME = pd.DataFrame(
-            [[0, "a", 10], [0, "b", 20], [0, "c", 30]],
-            index=[0, 1, 2],
-            columns=["index", "variable", "value"],
-        )
-
-        st._arrow_bar_chart(df, width=640, height=480)
-
-        proto = self.get_delta_from_queue().new_element.arrow_vega_lite_chart
-        chart_spec = json.loads(proto.spec)
-
-        self.assertEqual(chart_spec["mark"], "bar")
-        self.assertEqual(chart_spec["width"], 640)
-        self.assertEqual(chart_spec["height"], 480)
-        pd.testing.assert_frame_equal(
-            bytes_to_data_frame(proto.datasets[0].data.data),
-            EXPECTED_DATAFRAME,
-        )
-
-    def test_st_code(self):
-        """Test st.code."""
-        st.code("print('My string = %d' % my_value)", language="python")
-        expected = textwrap.dedent(
-            """
-            ```python
-            print('My string = %d' % my_value)
-            ```
+        The full public API should be covered by:
+        - element_mocks.WIDGET_ELEMENTS
+        - element_mocks.NON_WIDGET_ELEMENTS
+        - element_mocks.CONTAINER_ELEMENTS
+        - NON_ELEMENT_COMMANDS
         """
+        api = {
+            k
+            for k, v in st.__dict__.items()
+            if not k.startswith("_") and not isinstance(v, type(st))
+        }
+
+        mocked_elements = {
+            element
+            for element, _ in WIDGET_ELEMENTS + NON_WIDGET_ELEMENTS + CONTAINER_ELEMENTS
+        }
+        mocked_elements.update(NON_ELEMENT_COMMANDS)
+        assert api == mocked_elements, (
+            "There are new public commands that might be needed to be added to element "
+            "mocks or NON_ELEMENT_COMMANDS. Please add it to the correct list of "
+            "mocked elements or NON_ELEMENT_COMMANDS."
         )
 
-        el = self.get_delta_from_queue().new_element
-        self.assertEqual(el.markdown.body, expected.strip())
+    def test_public_api(self):
+        """Test that we don't accidentally remove (or add) symbols
+        to the public `st` API.
+        """
+        api = {
+            k
+            for k, v in st.__dict__.items()
+            if not k.startswith("_") and not isinstance(v, type(st))
+        }
+        assert api == ELEMENT_COMMANDS.union(NON_ELEMENT_COMMANDS)
 
-    def test_st_legacy_dataframe(self):
-        """Test st._legacy_dataframe."""
-        df = pd.DataFrame({"one": [1, 2], "two": [11, 22]})
+    def test_api_reference_doc_covers_public_api(self):
+        """Test that the api-reference.md skill doc stays in sync with the API.
 
-        st._legacy_dataframe(df)
+        The reference tables are hand-maintained, so this guards against them
+        silently drifting when new public commands or ``st.column_config``
+        helpers are added. Only names are checked, not their descriptions.
+        """
+        dirname = os.path.dirname(__file__)
+        lib_dir = os.path.abspath(os.path.join(dirname, "..", ".."))
+        reference_path = os.path.join(
+            lib_dir,
+            "streamlit",
+            ".agents",
+            "skills",
+            "developing-with-streamlit",
+            "references",
+            "api-reference.md",
+        )
+        with open(reference_path, encoding="utf-8") as f:
+            reference = f.read()
 
-        el = self.get_delta_from_queue().new_element
-        self.assertEqual(el.data_frame.data.cols[0].int64s.data, [1, 2])
-        self.assertEqual(
-            el.data_frame.columns.plain_index.data.strings.data, ["one", "two"]
+        # Top-level public commands (mirrors test_public_api).
+        top_level_api = {
+            k
+            for k, v in st.__dict__.items()
+            if not k.startswith("_") and not isinstance(v, type(st))
+        }
+        documented = set(
+            re.findall(r"^\| `st\.([A-Za-z0-9_]+)` \|", reference, re.MULTILINE)
+        )
+        missing = top_level_api - documented - API_REFERENCE_EXCLUSIONS
+        assert not missing, (
+            "These public st commands are missing from api-reference.md: "
+            f"{sorted(missing)}. Add them to the reference or, if intentionally "
+            "omitted, to API_REFERENCE_EXCLUSIONS."
         )
 
-    def test_st_arrow_dataframe(self):
-        """Test st._arrow_dataframe."""
-        from streamlit.type_util import bytes_to_data_frame
-
-        df = pd.DataFrame({"one": [1, 2], "two": [11, 22]})
-
-        st._arrow_dataframe(df)
-
-        proto = self.get_delta_from_queue().new_element.arrow_data_frame
-        pd.testing.assert_frame_equal(bytes_to_data_frame(proto.data), df)
-
-    def test_st_empty(self):
-        """Test st.empty."""
-        st.empty()
-
-        el = self.get_delta_from_queue().new_element
-        self.assertEqual(el.empty, EmptyProto())
-
-    def test_st_error(self):
-        """Test st.error."""
-        st.error("some error")
-
-        el = self.get_delta_from_queue().new_element
-        self.assertEqual(el.alert.body, "some error")
-        self.assertEqual(el.alert.format, Alert.ERROR)
-
-    def test_st_error_with_icon(self):
-        """Test st.error with icon."""
-        st.error("some error", icon="😱")
-
-        el = self.get_delta_from_queue().new_element
-        self.assertEqual(el.alert.body, "some error")
-        self.assertEqual(el.alert.icon, "😱")
-        self.assertEqual(el.alert.format, Alert.ERROR)
-
-    @parameterized.expand([(True,), (False,)])
-    def test_st_exception(self, show_error_details: bool):
-        """Test st.exception."""
-        # client.showErrorDetails has no effect on code that calls
-        # st.exception directly. This test should have the same result
-        # regardless fo the config option.
-        with testutil.patch_config_options(
-            {"client.showErrorDetails": show_error_details}
-        ):
-            e = RuntimeError("Test Exception")
-            st.exception(e)
-
-            el = self.get_delta_from_queue().new_element
-            self.assertEqual(el.exception.type, "RuntimeError")
-            self.assertEqual(el.exception.message, "Test Exception")
-            # We will test stack_trace when testing
-            # streamlit.elements.exception_element
-            self.assertEqual(el.exception.stack_trace, [])
-
-    def test_st_header(self):
-        """Test st.header."""
-        st.header("some header")
-
-        el = self.get_delta_from_queue().new_element
-        self.assertEqual(el.heading.body, "some header")
-        self.assertEqual(el.heading.tag, "h2")
-
-    def test_st_header_with_anchor(self):
-        """Test st.header with anchor."""
-        st.header("some header", anchor="some-anchor")
-
-        el = self.get_delta_from_queue().new_element
-        self.assertEqual(el.heading.body, "some header")
-        self.assertEqual(el.heading.tag, "h2")
-        self.assertEqual(el.heading.anchor, "some-anchor")
-
-    def test_st_help(self):
-        """Test st.help."""
-        st.help(st.header)
-
-        el = self.get_delta_from_queue().new_element
-        self.assertEqual(el.doc_string.name, "header")
-        self.assertEqual(el.doc_string.module, "streamlit")
-        self.assertTrue(
-            el.doc_string.doc_string.startswith("Display text in header formatting.")
+        # Reverse direction: every documented top-level ``st.<name>`` entry must
+        # still exist on ``st`` so renamed, removed, or typo'd rows are caught.
+        phantom = {name for name in documented if not hasattr(st, name)}
+        assert not phantom, (
+            "These commands are documented in api-reference.md but no longer "
+            f"exist on the public st API: {sorted(phantom)}. Remove or fix them."
         )
-        self.assertEqual(el.doc_string.type, "<class 'method'>")
-        if sys.version_info < (3, 9):
-            # Python < 3.9 represents the signature slightly differently
-            self.assertEqual(
-                el.doc_string.signature,
-                "(body: object, anchor: Union[str, NoneType] = None) -> 'DeltaGenerator'",
+
+        # st.column_config helpers. ``annotations`` is the leaked
+        # ``from __future__ import annotations`` symbol, not a real helper.
+        column_config_api = {
+            k for k in dir(st.column_config) if not k.startswith("_")
+        } - {"annotations"}
+        documented_column_config = set(
+            re.findall(
+                r"^\| `st\.column_config\.([A-Za-z0-9_]+)` \|",
+                reference,
+                re.MULTILINE,
             )
-        else:
-            self.assertEqual(
-                el.doc_string.signature,
-                "(body: object, anchor: Optional[str] = None) -> 'DeltaGenerator'",
-            )
-
-    def test_st_info(self):
-        """Test st.info."""
-        st.info("some info")
-
-        el = self.get_delta_from_queue().new_element
-        self.assertEqual(el.alert.body, "some info")
-        self.assertEqual(el.alert.format, Alert.INFO)
-
-    def test_st_info_with_icon(self):
-        """Test st.info with icon."""
-        st.info("some info", icon="👉🏻")
-
-        el = self.get_delta_from_queue().new_element
-        self.assertEqual(el.alert.body, "some info")
-        self.assertEqual(el.alert.icon, "👉🏻")
-        self.assertEqual(el.alert.format, Alert.INFO)
-
-    def test_st_json(self):
-        """Test st.json."""
-        st.json('{"some": "json"}')
-
-        el = self.get_delta_from_queue().new_element
-        self.assertEqual(el.json.body, '{"some": "json"}')
-
-        # Test that an object containing non-json-friendly keys can still
-        # be displayed.  Resultant json body will be missing those keys.
-
-        n = np.array([1, 2, 3, 4, 5])
-        data = {n[0]: "this key will not render as JSON", "array": n}
-        st.json(data)
-
-        el = self.get_delta_from_queue().new_element
-        self.assertEqual(el.json.body, '{"array": "array([1, 2, 3, 4, 5])"}')
-
-    def test_st_legacy_line_chart(self):
-        """Test st._legacy_line_chart."""
-        df = pd.DataFrame([[10, 20, 30]], columns=["a", "b", "c"])
-        st._legacy_line_chart(df, width=640, height=480)
-
-        el = self.get_delta_from_queue().new_element.vega_lite_chart
-        chart_spec = json.loads(el.spec)
-        self.assertEqual(chart_spec["mark"], "line")
-        self.assertEqual(chart_spec["width"], 640)
-        self.assertEqual(chart_spec["height"], 480)
-
-        self.assertEqual(
-            el.datasets[0].data.columns.plain_index.data.strings.data,
-            ["index", "variable", "value"],
+        )
+        missing_column_config = column_config_api - documented_column_config
+        assert not missing_column_config, (
+            "These st.column_config helpers are missing from api-reference.md: "
+            f"{sorted(missing_column_config)}."
         )
 
-        data = json.loads(json_format.MessageToJson(el.datasets[0].data.data))
-        result = [x["int64s"]["data"] for x in data["cols"] if "int64s" in x]
-
-        self.assertEqual(result[1], ["10", "20", "30"])
-
-    def test_st_arrow_line_chart(self):
-        """Test st._arrow_line_chart."""
-        from streamlit.type_util import bytes_to_data_frame
-
-        df = pd.DataFrame([[10, 20, 30]], columns=["a", "b", "c"])
-        EXPECTED_DATAFRAME = pd.DataFrame(
-            [[0, "a", 10], [0, "b", 20], [0, "c", 30]],
-            index=[0, 1, 2],
-            columns=["index", "variable", "value"],
-        )
-        st._arrow_line_chart(df, width=640, height=480)
-
-        proto = self.get_delta_from_queue().new_element.arrow_vega_lite_chart
-        chart_spec = json.loads(proto.spec)
-
-        self.assertEqual(chart_spec["mark"], "line")
-        self.assertEqual(chart_spec["width"], 640)
-        self.assertEqual(chart_spec["height"], 480)
-        pd.testing.assert_frame_equal(
-            bytes_to_data_frame(proto.datasets[0].data.data),
-            EXPECTED_DATAFRAME,
+        # Reverse direction for ``st.column_config`` so removed or renamed
+        # helpers documented in the reference are caught.
+        phantom_column_config = {
+            name
+            for name in documented_column_config
+            if not hasattr(st.column_config, name)
+        }
+        assert not phantom_column_config, (
+            "These st.column_config helpers are documented in api-reference.md "
+            f"but no longer exist: {sorted(phantom_column_config)}. Remove or fix "
+            "them."
         )
 
-    def test_st_markdown(self):
-        """Test st.markdown."""
-        st.markdown("    some markdown  ")
+    def test_pydoc(self):
+        """Test that we can run pydoc on the streamlit package"""
+        cwd = os.getcwd()
+        try:
+            os.chdir(tempfile.mkdtemp())
+            # Run the script as a separate process to make sure that
+            # the currently loaded modules do not affect the test result.
+            output = subprocess.check_output(
+                [sys.executable, "-m", "pydoc", "streamlit"]
+            ).decode()
+            assert "Help on package streamlit:" in output
+        finally:
+            os.chdir(cwd)
 
-        el = self.get_delta_from_queue().new_element
-        self.assertEqual(el.markdown.body, "some markdown")
 
-        # test the unsafe_allow_html keyword
-        st.markdown("    some markdown  ", unsafe_allow_html=True)
+@pytest.mark.usefixtures("benchmark")
+def test_cold_import_time(benchmark):
+    """
+    Measure the import time of `streamlit` by spawning a new Python subprocess.
 
-        el = self.get_delta_from_queue().new_element
-        self.assertEqual(el.markdown.body, "some markdown")
-        self.assertTrue(el.markdown.allow_html)
+    This simulates a “cold” import because each run starts a fresh
+    interpreter session. It includes Python startup overhead, so it
+    approximates how a user experiences an import in a newly launched
+    Python process.
+    """
 
-    def test_st_progress(self):
-        """Test st.progress."""
-        st.progress(51)
+    def do_cold_import():
+        # We invoke a separate Python process that just imports the package.
+        subprocess.check_call([sys.executable, "-c", "import streamlit"])
 
-        el = self.get_delta_from_queue().new_element
-        self.assertEqual(el.progress.value, 51)
+    benchmark(do_cold_import)
 
-    def test_st_spinner(self):
-        """Test st.spinner."""
-        with st.spinner("some text"):
-            # Without the timeout, the spinner is sometimes not available
-            time.sleep(0.2)
-            el = self.get_delta_from_queue().new_element
-            self.assertEqual(el.spinner.text, "some text")
 
-    def test_st_plotly_chart_simple(self):
-        """Test st.plotly_chart."""
-        import plotly.graph_objs as go
+def test_importtime_median_under_threshold():
+    """
+    Measure the import time of Streamlit via the built-in `importtime`
+    in a fresh interpreter, compute the median import time,
+    and check if it's under a static threshold.
+    """
+    # Define an acceptable threshold for import time (in microseconds).
+    # This value is also dependent a bit on the machine it's run on,
+    # so needs to be mainly adjusted to our CI runners.
+    # While its important to keep the import time low, you can
+    # modify this threshold if it's really needed to add some new features.
+    # But make sure that its justified and intended.
+    max_allowed_import_time_us = 700_000
 
-        trace0 = go.Scatter(x=[1, 2, 3, 4], y=[10, 15, 13, 17])
+    import_times = []
 
-        data = [trace0]
+    for _ in range(25):
+        # Spawn a subprocess that imports `streamlit` with Python's importtime
+        # instrumentation
+        cmd = [sys.executable, "-X", "importtime", "-c", "import streamlit"]
+        p = subprocess.run(cmd, stderr=subprocess.PIPE, check=True)
 
-        st.plotly_chart(data)
+        # The last line of stderr has the total import time:
+        # import time: self [us] | cumulative [us] | streamlit
+        line = p.stderr.splitlines()[-1]
+        field = line.split(b"|")[-2].strip()  # e.g. b"123456"
+        total_us = int(field)  # convert to integer microseconds
+        import_times.append(total_us)
 
-        el = self.get_delta_from_queue().new_element
-        self.assertEqual(el.plotly_chart.HasField("url"), False)
-        self.assertNotEqual(el.plotly_chart.figure.spec, "")
-        self.assertNotEqual(el.plotly_chart.figure.config, "")
-        self.assertEqual(el.plotly_chart.use_container_width, False)
+    # Calculate the median import time across all runs
+    median_time_us = statistics.median(import_times)
 
-    def test_st_plotly_chart_use_container_width_true(self):
-        """Test st.plotly_chart."""
-        import plotly.graph_objs as go
-
-        trace0 = go.Scatter(x=[1, 2, 3, 4], y=[10, 15, 13, 17])
-
-        data = [trace0]
-
-        st.plotly_chart(data, use_container_width=True)
-
-        el = self.get_delta_from_queue().new_element
-        self.assertEqual(el.plotly_chart.HasField("url"), False)
-        self.assertNotEqual(el.plotly_chart.figure.spec, "")
-        self.assertNotEqual(el.plotly_chart.figure.config, "")
-        self.assertEqual(el.plotly_chart.use_container_width, True)
-
-    def test_st_plotly_chart_sharing(self):
-        """Test st.plotly_chart when sending data to Plotly's service."""
-        import plotly.graph_objs as go
-
-        trace0 = go.Scatter(x=[1, 2, 3, 4], y=[10, 15, 13, 17])
-
-        data = [trace0]
-
-        with patch(
-            "streamlit.elements.plotly_chart." "_plot_to_url_or_load_cached_url"
-        ) as plot_patch:
-            plot_patch.return_value = "the_url"
-            st.plotly_chart(data, sharing="public")
-
-        el = self.get_delta_from_queue().new_element
-        self.assertEqual(el.plotly_chart.HasField("figure"), False)
-        self.assertNotEqual(el.plotly_chart.url, "the_url")
-        self.assertEqual(el.plotly_chart.use_container_width, False)
-
-    def test_st_subheader(self):
-        """Test st.subheader."""
-        st.subheader("some subheader")
-
-        el = self.get_delta_from_queue().new_element
-        self.assertEqual(el.heading.body, "some subheader")
-        self.assertEqual(el.heading.tag, "h3")
-
-    def test_st_subheader_with_anchor(self):
-        """Test st.subheader with anchor."""
-        st.subheader("some subheader", anchor="some-anchor")
-
-        el = self.get_delta_from_queue().new_element
-        self.assertEqual(el.heading.body, "some subheader")
-        self.assertEqual(el.heading.tag, "h3")
-        self.assertEqual(el.heading.anchor, "some-anchor")
-
-    def test_st_success(self):
-        """Test st.success."""
-        st.success("some success")
-
-        el = self.get_delta_from_queue().new_element
-        self.assertEqual(el.alert.body, "some success")
-        self.assertEqual(el.alert.format, Alert.SUCCESS)
-
-    def test_st_success_with_icon(self):
-        """Test st.success with icon."""
-        st.success("some success", icon="✅")
-
-        el = self.get_delta_from_queue().new_element
-        self.assertEqual(el.alert.body, "some success")
-        self.assertEqual(el.alert.icon, "✅")
-        self.assertEqual(el.alert.format, Alert.SUCCESS)
-
-    def test_st_legacy_table(self):
-        """Test st._legacy_table."""
-        df = pd.DataFrame([[1, 2], [3, 4]], columns=["col1", "col2"])
-
-        st._legacy_table(df)
-
-        el = self.get_delta_from_queue().new_element
-        self.assertEqual(el.table.data.cols[0].int64s.data, [1, 3])
-        self.assertEqual(el.table.data.cols[1].int64s.data, [2, 4])
-        self.assertEqual(
-            el.table.columns.plain_index.data.strings.data, ["col1", "col2"]
-        )
-
-    def test_st_arrow_table(self):
-        """Test st._arrow_table."""
-        from streamlit.type_util import bytes_to_data_frame
-
-        df = pd.DataFrame([[1, 2], [3, 4]], columns=["col1", "col2"])
-
-        st._arrow_table(df)
-
-        proto = self.get_delta_from_queue().new_element.arrow_table
-        pd.testing.assert_frame_equal(bytes_to_data_frame(proto.data), df)
-
-    def test_st_text(self):
-        """Test st.text."""
-        st.text("some text")
-
-        el = self.get_delta_from_queue().new_element
-        self.assertEqual(el.text.body, "some text")
-
-    def test_st_title(self):
-        """Test st.title."""
-        st.title("some title")
-
-        el = self.get_delta_from_queue().new_element
-        self.assertEqual(el.heading.body, "some title")
-        self.assertEqual(el.heading.tag, "h1")
-
-    def test_st_title_with_anchor(self):
-        """Test st.title with anchor."""
-        st.title("some title", anchor="some-anchor")
-
-        el = self.get_delta_from_queue().new_element
-        self.assertEqual(el.heading.body, "some title")
-        self.assertEqual(el.heading.tag, "h1")
-        self.assertEqual(el.heading.anchor, "some-anchor")
-
-    def test_st_legacy_vega_lite_chart(self):
-        """Test st._legacy_vega_lite_chart."""
-        pass
-
-    def test_st_warning(self):
-        """Test st.warning."""
-        st.warning("some warning")
-
-        el = self.get_delta_from_queue().new_element
-        self.assertEqual(el.alert.body, "some warning")
-        self.assertEqual(el.alert.format, Alert.WARNING)
-
-    def test_st_warning_with_icon(self):
-        """Test st.warning with icon."""
-        st.warning("some warning", icon="⚠️")
-
-        el = self.get_delta_from_queue().new_element
-        self.assertEqual(el.alert.body, "some warning")
-        self.assertEqual(el.alert.icon, "⚠️")
-        self.assertEqual(el.alert.format, Alert.WARNING)
-
-    @parameterized.expand([(st.error,), (st.warning,), (st.info,), (st.success,)])
-    def test_st_alert_exceptions(self, alert_func):
-        """Test that alert functions throw an exception when a non-emoji is given as an icon."""
-        with self.assertRaises(StreamlitAPIException):
-            alert_func("some alert", icon="hello world")
+    # Check if the median is within the desired threshold
+    assert median_time_us <= max_allowed_import_time_us, (
+        f"Median import time {round(median_time_us)}us of streamlit exceeded the max "
+        f"allowed threshold {max_allowed_import_time_us}us (percentage: "
+        f"{round(median_time_us / max_allowed_import_time_us * 100)}%)."
+        "In case this is expected and justified, you can change the "
+        "threshold in the test."
+    )

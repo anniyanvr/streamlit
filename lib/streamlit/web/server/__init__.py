@@ -1,4 +1,4 @@
-# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022)
+# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .component_request_handler import ComponentRequestHandler
-from .routes import (
-    allow_cross_origin_requests as allow_cross_origin_requests,
+from streamlit.web.server.server import Server, server_address_is_unix_socket
+from streamlit.web.server.server_util import (
+    allow_all_cross_origin_requests,
+    is_allowed_origin,
 )
-from .server import (
-    Server as Server,
-    server_address_is_unix_socket as server_address_is_unix_socket,
-)
-from .stats_request_handler import StatsRequestHandler
+
+__all__ = [
+    "Server",
+    "allow_all_cross_origin_requests",
+    "is_allowed_origin",
+    "server_address_is_unix_socket",
+]

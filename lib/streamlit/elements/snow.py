@@ -1,4 +1,4 @@
-# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022)
+# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,8 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import cast, TYPE_CHECKING
+from __future__ import annotations
 
+from typing import TYPE_CHECKING, cast
+
+from streamlit.elements.lib import agent_spec
 from streamlit.proto.Snow_pb2 import Snow as SnowProto
 from streamlit.runtime.metrics_util import gather_metrics
 
@@ -22,12 +25,14 @@ if TYPE_CHECKING:
 
 
 class SnowMixin:
-    @gather_metrics
-    def snow(self) -> "DeltaGenerator":
+    @gather_metrics("snow")
+    def snow(self) -> DeltaGenerator:
         """Draw celebratory snowfall.
 
-        Example
-        -------
+        Examples
+        --------
+        >>> import streamlit as st
+        >>>
         >>> st.snow()
 
         ...then watch your app and get ready for a cool celebration!
@@ -35,9 +40,14 @@ class SnowMixin:
         """
         snow_proto = SnowProto()
         snow_proto.show = True
-        return self.dg._enqueue("snow", snow_proto)
+        return self.dg._enqueue(
+            "snow",
+            snow_proto,
+            has_one_shot_effect=True,
+            agent_props=agent_spec.element("snow"),
+        )
 
     @property
-    def dg(self) -> "DeltaGenerator":
-        """Get our DeltaGenerator."""
+    def dg(self) -> DeltaGenerator:
+        """The associated DeltaGenerator."""
         return cast("DeltaGenerator", self)

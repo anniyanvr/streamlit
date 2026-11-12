@@ -1,4 +1,4 @@
-# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022)
+# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,88 +12,356 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-import threading
-import uuid
+from __future__ import annotations
+
 import contextlib
-import sys
 import inspect
-from collections.abc import Sized
-from functools import wraps
-from timeit import default_timer as timer
-from typing import Any, Callable, List, Optional, TypeVar, cast, Set
+import os
+import re
+import sys
+import threading
+import time
+import uuid
+from collections.abc import Callable, Sequence, Sized
+from functools import lru_cache, wraps
+from typing import Any, Final, TypeVar, cast, overload
 
-from typing_extensions import Final
-
-from streamlit import util
-from streamlit import config
+from streamlit import config, file_util, type_util, util
+from streamlit.errors import LocalizableStreamlitException, StreamlitAPIException
 from streamlit.logger import get_logger
-from streamlit.proto.PageProfile_pb2 import Argument, Command
 from streamlit.proto.ForwardMsg_pb2 import ForwardMsg
-from streamlit.runtime.scriptrunner import get_script_run_ctx
+from streamlit.proto.PageProfile_pb2 import Argument, Command
+from streamlit.runtime.agent import usage as agent_usage
+from streamlit.runtime.scriptrunner_utils.exceptions import RerunException
+from streamlit.runtime.scriptrunner_utils.script_run_context import (
+    FragmentThreadState,
+    ThreadState,
+    get_script_run_ctx,
+)
 
-
-LOGGER = get_logger(__name__)
+_LOGGER: Final = get_logger(__name__)
 
 # Limit the number of commands to keep the page profile message small
-# since Segment allows only a maximum of 32kb per event.
-_MAX_TRACKED_COMMANDS: Final = 200
+_MAX_TRACKED_COMMANDS: Final = 400
+# Only track a maximum of 25 uses per unique command since some apps use
+# commands excessively (e.g. calling write thousands of times in one rerun)
+# making the page profile useless.
+_MAX_TRACKED_PER_COMMAND: Final = 25
+
 # A mapping to convert from the actual name to preferred/shorter representations
 _OBJECT_NAME_MAPPING: Final = {
     "streamlit.delta_generator.DeltaGenerator": "DG",
+    # pandas 2.x paths
     "pandas.core.frame.DataFrame": "DataFrame",
-    "plotly.graph_objs._figure.Figure": "PlotlyFigure",
-    "bokeh.plotting.figure.Figure": "BokehFigure",
-    "matplotlib.figure.Figure": "MatplotlibFigure",
-    "pandas.io.formats.style.Styler": "PandasStyler",
     "pandas.core.indexes.base.Index": "PandasIndex",
     "pandas.core.series.Series": "PandasSeries",
+    # pandas 3.x paths (module changed from pandas.core.* to pandas.*)
+    "pandas.DataFrame": "DataFrame",
+    "pandas.Index": "PandasIndex",
+    "pandas.Series": "PandasSeries",
+    "plotly.graph_objs._figure.Figure": "PlotlyFigure",
+    "matplotlib.figure.Figure": "MatplotlibFigure",
+    "pandas.io.formats.style.Styler": "PandasStyler",
+    "streamlit.connections.sql_connection.SQLConnection": "SQLConnection",
 }
-_CALLABLE_NAME_MAPPING: Final = {
-    "_transparent_write": "magic",
-    "MemoAPI.__call__": "experimental_memo",
-    "SingletonAPI.__call__": "experimental_singleton",
-    "SingletonAPI.clear": "clear_singleton",
-    "MemoAPI.clear": "clear_memo",
-    "SingletonCache.write_result": "_cache_singleton_object",
-    "MemoCache.write_result": "_cache_memo_object",
-    "_write_to_cache": "_cache_object",
-}
+
 # A list of dependencies to check for attribution
-_ATTRIBUTIONS_TO_CHECK: Final = ["snowflake"]
+_ATTRIBUTIONS_TO_CHECK: Final = [
+    # DB Clients:
+    "pymysql",
+    "MySQLdb",
+    "mysql",
+    "pymongo",
+    "ibis",
+    "boto3",
+    "psycopg2",
+    "psycopg3",
+    "sqlalchemy",
+    "elasticsearch",
+    "pyodbc",
+    "pymssql",
+    "cassandra",
+    "azure",
+    "redis",
+    "sqlite3",
+    "neo4j",
+    "duckdb",
+    "opensearchpy",
+    "supabase",
+    "databricks",
+    # Dataframe Libraries:
+    "polars",
+    "dask",
+    "vaex",
+    "modin",
+    "pyspark",
+    "cudf",
+    "xarray",
+    "geopandas",
+    "mars",
+    "tables",
+    "zarr",
+    "datasets",
+    "daft",
+    # ML & LLM Tools:
+    "mistralai",
+    "openai",
+    "langchain",
+    "llama_index",
+    "llama_cpp",
+    "anthropic",
+    "pyllamacpp",
+    "cohere",
+    "transformers",
+    "nomic",
+    "diffusers",
+    "semantic_kernel",
+    "replicate",
+    "huggingface_hub",
+    "wandb",
+    "torch",
+    "tensorflow",
+    "trubrics",
+    "comet_ml",
+    "clarifai",
+    "reka",
+    "hegel",
+    "fastchat",
+    "assemblyai",
+    "openllm",
+    "embedchain",
+    "haystack",
+    "vllm",
+    "alpa",
+    "jinaai",
+    "guidance",
+    "litellm",
+    "comet_llm",
+    "instructor",
+    "xgboost",
+    "lightgbm",
+    "catboost",
+    "sklearn",
+    "pydantic_ai",
+    "datachain",
+    "docling",
+    "litserve",
+    "crawl4ai",
+    "baml_client",
+    "browser_use",
+    "crewai",
+    "unsloth",
+    "langgraph",
+    "dspy",
+    "ultralytics",
+    "instructor",
+    "ragas",
+    "swarm",
+    "faster_whisper",
+    "memori",
+    "autogen_agentchat",
+    "xai_sdk",
+    "agno",
+    "langfuse",
+    "smolagents",
+    "ollama",
+    "groq",
+    "together",
+    "ai21",
+    "marvin",
+    "outlines",
+    "guardrails",
+    "promptflow",
+    "semantic_router",
+    "mem0",
+    "aisuite",
+    "mlflow",
+    "optuna",
+    "keras",
+    "jax",
+    "shap",
+    "evidently",
+    "great_expectations",
+    "bentoml",
+    "modal",
+    "sagemaker",
+    "vertexai",
+    "tiktoken",
+    "sentence_transformers",
+    "spacy",
+    "nltk",
+    "onnxruntime",
+    "llama_api_client",
+    # Workflow Tools:
+    "prefect",
+    "luigi",
+    "airflow",
+    "dagster",
+    "celery",
+    # Vector Stores:
+    "pgvector",
+    "faiss",
+    "annoy",
+    "pinecone",
+    "chromadb",
+    "weaviate",
+    "qdrant_client",
+    "pymilvus",
+    "lancedb",
+    # Others:
+    "snowflake",
+    "pydantic",
+    "fastapi",
+    "playwright",
+    "folium",
+    "geopandas",
+    "httpx",
+    "pyecharts",
+    "fastplotlib",
+    "pygfx",
+    "highcharts_core",
+    # Optional streamlit dependencies:
+    "seaborn",
+    "graphviz",
+    "matplotlib",
+    "uvloop",
+    "orjson",
+    "rich",
+    "streamlit_extras",
+    "streamlit_pydantic",
+    "pygwalker",
+    "plotly",
+    "bokeh",
+    "plost",
+    "authlib",
+    # Document Processing:
+    "pypdf",
+    "pdfplumber",
+    "docx",
+    "openpyxl",
+    "xlsxwriter",
+    # Image/Vision:
+    "cv2",
+    "mediapipe",
+]
 
 _ETC_MACHINE_ID_PATH = "/etc/machine-id"
 _DBUS_MACHINE_ID_PATH = "/var/lib/dbus/machine-id"
 
+# Matches CPython's ``got an unexpected keyword argument 'name'`` TypeError.
+_UNEXPECTED_KWARG_RE: Final = re.compile(
+    r"got an unexpected keyword argument '([^']+)'"
+)
+# ``foo() missing 1 required positional argument: 'bar'`` (also keyword-only).
+_MISSING_ARG_RE: Final = re.compile(
+    r"missing \d+ required (?:positional |keyword-only )?arguments?: '(\w+)'"
+)
+_NO_MODULE_RE: Final = re.compile(r"No module named ['\"]([^'\"]+)['\"]")
+_CANNOT_IMPORT_FROM_RE: Final = re.compile(r"cannot import name '[^']+' from '([^']+)'")
+_STREAMLIT_ATTRIBUTE_RE: Final = re.compile(
+    r"module 'streamlit' has no attribute '([^']+)'"
+)
+# Import namespaces used by Streamlit itself or by its optional features. Only
+# these names are appended to telemetry to avoid recording private app modules.
+_STREAMLIT_IMPORT_MODULE_PREFIXES: Final = frozenset(
+    {
+        "altair",
+        "anyio",
+        "authlib",
+        "click",
+        "google.protobuf",
+        "graphviz",
+        "httptools",
+        "httpx",
+        "itsdangerous",
+        "matplotlib",
+        "multipart",
+        "numpy",
+        "orjson",
+        "packaging",
+        "pandas",
+        "PIL",
+        "plotly",
+        "pyarrow",
+        "pydeck",
+        "python_multipart",
+        "requests",
+        "rich",
+        "snowflake",
+        "sqlalchemy",
+        "starlette",
+        "streamlit",
+        "streamlit_pdf",
+        "toml",
+        "typing_extensions",
+        "uvicorn",
+        "uvloop",
+        "watchdog",
+        "websockets",
+    }
+)
+
 
 def _get_machine_id_v3() -> str:
-    """Get the machine ID
+    """Get the machine ID.
 
-    This is a unique identifier for a user for tracking metrics in Segment,
+    This is a unique identifier for a user for tracking metrics,
     that is broken in different ways in some Linux distros and Docker images.
     - at times just a hash of '', which means many machines map to the same ID
     - at times a hash of the same string, when running in a Docker container
     """
 
-    machine_id = str(uuid.getnode())
     if os.path.isfile(_ETC_MACHINE_ID_PATH):
-        with open(_ETC_MACHINE_ID_PATH, "r") as f:
+        with open(_ETC_MACHINE_ID_PATH, encoding="utf-8") as f:
             machine_id = f.read()
 
     elif os.path.isfile(_DBUS_MACHINE_ID_PATH):
-        with open(_DBUS_MACHINE_ID_PATH, "r") as f:
+        with open(_DBUS_MACHINE_ID_PATH, encoding="utf-8") as f:
             machine_id = f.read()
+
+    else:
+        machine_id = str(uuid.getnode())
 
     return machine_id
 
 
+def _get_machine_id_v4() -> str:
+    """Get a random ID that is stable for each machine, generating if needed.
+
+    This is a unique identifier for a user for tracking metrics.
+    Instead of relying on a hardware address in the container or host we'll
+    generate a UUID and store it in the ~/.streamlit hidden folder.
+    """
+    # If gatherUsageStats is False skip this whole code.
+    # This is just for people who don't want the extra machine_id_v4 file
+    # in their file system.
+    if not config.get_option("browser.gatherUsageStats"):
+        # This value will never be sent to our telemetry. Just including it here
+        # to help debug.
+        return "no-machine-id-v4"
+
+    filepath = file_util.get_streamlit_file_path("machine_id_v4")
+    stable_id = None
+
+    if os.path.exists(filepath):
+        with file_util.streamlit_read(filepath) as file:
+            stable_id = file.read()
+
+    if not stable_id:
+        stable_id = str(uuid.uuid4())
+        with file_util.streamlit_write(filepath) as output:
+            output.write(stable_id)
+
+    return stable_id
+
+
 class Installation:
     _instance_lock = threading.Lock()
-    _instance = None  # type: Optional[Installation]
+    _instance: Installation | None = None
 
     @classmethod
-    def instance(cls) -> "Installation":
-        """Returns the singleton Installation"""
+    def instance(cls) -> Installation:
+        """Returns the singleton Installation."""
         # We use a double-checked locking optimization to avoid the overhead
         # of acquiring the lock in the common case:
         # https://en.wikipedia.org/wiki/Double-checked_locking
@@ -101,24 +369,28 @@ class Installation:
             with cls._instance_lock:
                 if cls._instance is None:
                     cls._instance = Installation()
+
         return cls._instance
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.installation_id_v3 = str(
             uuid.uuid5(uuid.NAMESPACE_DNS, _get_machine_id_v3())
         )
+
+        self.installation_id_v4 = _get_machine_id_v4()
 
     def __repr__(self) -> str:
         return util.repr_(self)
 
     @property
-    def installation_id(self):
+    def installation_id(self) -> str:
         return self.installation_id_v3
 
 
 def _get_type_name(obj: object) -> str:
+    """Get a simplified name for the type of the given object."""
     with contextlib.suppress(Exception):
-        obj_type = type(obj)
+        obj_type = obj if inspect.isclass(obj) else type(obj)
         type_name = "unknown"
         if hasattr(obj_type, "__qualname__"):
             type_name = obj_type.__qualname__
@@ -135,25 +407,16 @@ def _get_type_name(obj: object) -> str:
     return "failed"
 
 
-def _get_callable_name(callable: Callable[..., Any]) -> str:
-    with contextlib.suppress(Exception):
-        name = "unknown"
-        if inspect.isclass(callable):
-            name = callable.__class__.__name__
-        elif hasattr(callable, "__qualname__"):
-            name = callable.__qualname__
-        elif hasattr(callable, "__name__"):
-            name = callable.__name__
-        if name in _CALLABLE_NAME_MAPPING:
-            name = _CALLABLE_NAME_MAPPING[name]
-        elif "." in name:
-            # Only return actual function name
-            name = name.split(".")[-1]
-        return name
-    return "failed"
+def _get_top_level_module(func: Callable[..., Any]) -> str:
+    """Get the top level module for the given function."""
+    module = inspect.getmodule(func)
+    if module is None or not module.__name__:
+        return "unknown"
+    return module.__name__.split(".")[0]
 
 
-def _get_arg_metadata(arg: object) -> Optional[str]:
+def _get_arg_metadata(arg: object) -> str | None:
+    """Get metadata information related to the value of the given object."""
     with contextlib.suppress(Exception):
         if isinstance(arg, (bool)):
             return f"val:{arg}"
@@ -164,17 +427,73 @@ def _get_arg_metadata(arg: object) -> Optional[str]:
     return None
 
 
-def _get_command_telemetry(callable: Callable[..., Any], *args, **kwargs) -> Command:
-    arg_keywords = inspect.getfullargspec(callable).args
-    self_arg: Optional[Any] = None
-    arguments: List[Argument] = []
-    is_method = inspect.ismethod(callable)
+@lru_cache(maxsize=256)
+def _get_arg_keywords_cached(func: Callable[..., Any]) -> tuple[str, ...]:
+    """Return POSITIONAL_ONLY and POSITIONAL_OR_KEYWORD parameter names as an immutable tuple.
+
+    Results are cached by function identity. Callers must pass ``func.__func__``
+    for bound methods — this function operates on unbound callables only.
+
+    On Python 3.14+, PEP 649 causes annotation evaluation to be deferred until
+    accessed. This can fail with NameError when annotations reference types
+    imported under TYPE_CHECKING. Since we only need parameter names (not
+    annotations), we use ``annotation_format=Format.STRING`` to avoid evaluation.
+
+    See: https://github.com/streamlit/streamlit/issues/14324
+    """
+    params = type_util.get_func_parameters(func)
+    return tuple(
+        p.name
+        for p in params
+        if p.kind
+        in {inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD}
+    )
+
+
+def _get_arg_keywords(func: Callable[..., Any]) -> list[str]:
+    """Return argument names from a function's signature.
+
+    This returns argument names matching the behavior of getfullargspec().args:
+    - Both POSITIONAL_ONLY and POSITIONAL_OR_KEYWORD parameters (not keyword-only)
+    - Includes 'self' for bound methods
+
+    Uses caching to avoid repeated expensive inspect.signature() calls.
+
+    Note: The underlying LRU cache holds strong references to function objects.
+    This is fine for typical Streamlit usage with module-level functions, but
+    dynamically created callables (e.g., closures, partials) may be retained
+    until evicted from the cache.
+    """
+    # For bound methods, use __func__ as cache key: this ensures cache hits
+    # across different bound instances of the same method, and
+    # get_func_parameters(__func__) already includes 'self'.
+    if inspect.ismethod(func):
+        return list(_get_arg_keywords_cached(func.__func__))
+    return list(_get_arg_keywords_cached(func))
+
+
+def _get_command_telemetry(
+    _command_func: Callable[..., Any],
+    _command_name: str,
+    *args: Any,
+    _positional_arg_offset: int = 0,
+    **kwargs: Any,
+) -> Command:
+    """Get telemetry information for the given callable and its arguments."""
+    arg_keywords = _get_arg_keywords(_command_func)
+    self_arg: Any | None = None
+    arguments: list[Argument] = []
+    is_method = inspect.ismethod(_command_func)
+    name = _command_name
 
     for i, arg in enumerate(args):
-        pos = i
+        # Offset the recorded position so a decorated method's first real
+        # argument lands at position 0, matching a plain-function command that
+        # has no leading ``self`` argument (see ``_positional_arg_offset``).
+        pos = i - _positional_arg_offset
         if is_method:
-            # If the callable is a method, ignore the first argument (self)
-            i = i + 1
+            # If func is a method, ignore the first argument (self)
+            i += 1  # noqa: PLW2901
 
         keyword = arg_keywords[i] if len(arg_keywords) > i else f"{i}"
         if keyword == "self":
@@ -193,7 +512,13 @@ def _get_command_telemetry(callable: Callable[..., Any], *args, **kwargs) -> Com
         if arg_metadata:
             argument.m = arg_metadata
         arguments.append(argument)
-    name = _get_callable_name(callable)
+
+    top_level_module = _get_top_level_module(_command_func)
+    if top_level_module != "streamlit":
+        # If the gather_metrics decorator is used outside of streamlit library
+        # we enforce a prefix to be added to the tracked command:
+        name = f"external:{top_level_module}:{name}"
+
     if (
         name == "create_instance"
         and self_arg
@@ -201,101 +526,304 @@ def _get_command_telemetry(callable: Callable[..., Any], *args, **kwargs) -> Com
         and self_arg.name
     ):
         name = f"component:{self_arg.name}"
+
+    if name == "_bidi_component" and len(args) > 1 and isinstance(args[1], str):
+        # Bound DeltaGenerator methods always receive `self` as args[0], so args[1]
+        # is the user-supplied component name.
+        component_name = args[1]
+        name = f"component_v2:{component_name}"
+
     return Command(name=name, args=arguments)
 
 
-def to_microseconds(seconds):
-    return int(seconds * 1000000)
+def to_microseconds(seconds: float) -> int:
+    """Convert seconds into microseconds."""
+    return int(seconds * 1_000_000)
+
+
+def _is_streamlit_import_module(module: str) -> bool:
+    """Return whether an import namespace is relevant to Streamlit internals."""
+    return any(
+        module == prefix or module.startswith(f"{prefix}.")
+        for prefix in _STREAMLIT_IMPORT_MODULE_PREFIXES
+    )
+
+
+def format_uncaught_exception(exc: BaseException) -> str:
+    """Return a page-profile label for an uncaught exception.
+
+    Uses the exception type name, appending a short suffix when a stable
+    category is known:
+
+    - unexpected-keyword ``TypeError`` → ``"TypeError:<param>"``
+    - missing required argument ``TypeError`` → ``"TypeError:missing:<param>"``
+    - allowlisted ``ImportError`` / ``ModuleNotFoundError``
+      → ``"<Type>:<module>"``
+    - missing top-level ``streamlit`` attributes → ``"AttributeError:<attribute>"``
+    - ``LocalizableStreamlitException`` with a ``parameter`` kwarg
+      → ``"<Type>:<parameter>"``
+    - ``StreamlitAPIException`` with ``error_id`` (when there is no
+      ``parameter``) → ``"<Type>:<error_id>"``
+
+    Does not append user values such as widget keys or file paths.
+    Enrichment failures are swallowed so telemetry cannot interrupt script
+    execution or drop the page-profile payload.
+    """
+    name = type(exc).__name__
+    with contextlib.suppress(Exception):
+        if isinstance(exc, TypeError):
+            msg = str(exc)
+            match = _UNEXPECTED_KWARG_RE.search(msg)
+            if match:
+                return f"{name}:{match.group(1)}"
+            match = _MISSING_ARG_RE.search(msg)
+            if match:
+                return f"{name}:missing:{match.group(1)}"
+        elif isinstance(exc, ImportError):
+            module = getattr(exc, "name", None)
+            if not isinstance(module, str) or not module:
+                msg = str(exc)
+                match = _NO_MODULE_RE.search(msg) or _CANNOT_IMPORT_FROM_RE.search(msg)
+                module = match.group(1) if match else None
+            if (
+                isinstance(module, str)
+                and module
+                and _is_streamlit_import_module(module)
+            ):
+                return f"{name}:{module}"
+        elif isinstance(exc, AttributeError):
+            attribute = getattr(exc, "name", None)
+            obj = getattr(exc, "obj", None)
+            if (
+                obj is sys.modules.get("streamlit")
+                and isinstance(attribute, str)
+                and attribute
+            ):
+                return f"{name}:{attribute}"
+            if obj is None and attribute is None:
+                match = _STREAMLIT_ATTRIBUTE_RE.fullmatch(str(exc))
+                if match:
+                    return f"{name}:{match.group(1)}"
+        elif isinstance(exc, StreamlitAPIException):
+            if isinstance(exc, LocalizableStreamlitException):
+                parameter = exc.exec_kwargs.get("parameter")
+                if isinstance(parameter, str) and parameter:
+                    return f"{name}:{parameter}"
+            error_id = exc.error_id
+            if isinstance(error_id, str) and error_id:
+                return f"{name}:{error_id}"
+    return name
 
 
 F = TypeVar("F", bound=Callable[..., Any])
 
 
-def gather_metrics(callable: F) -> F:
-    @wraps(callable)
-    def wrap(*args, **kwargs):
+@overload
+def gather_metrics(
+    name: str,
+    func: F,
+    *,
+    _positional_arg_offset: int = 0,
+) -> F: ...
 
-        ctx = get_script_run_ctx()
 
-        tracking_activated = (
-            ctx is not None
-            and ctx.gather_usage_stats
-            and not ctx.command_tracking_deactivated
-            and len(ctx.tracked_commands)
-            < _MAX_TRACKED_COMMANDS  # Prevent too much memory usage
-        )
+@overload
+def gather_metrics(
+    name: str,
+    func: None = None,
+    *,
+    _positional_arg_offset: int = 0,
+) -> Callable[[F], F]: ...
 
-        # Deactivate tracking to prevent calls inside already tracked commands
-        if ctx:
-            ctx.command_tracking_deactivated = True
+
+def gather_metrics(
+    name: str,
+    func: F | None = None,
+    *,
+    _positional_arg_offset: int = 0,
+) -> Callable[[F], F] | F:
+    """Function decorator to add telemetry tracking to commands.
+
+    Parameters
+    ----------
+    name : str
+        The name to use for telemetry tracking.
+    func : callable or None
+        The function to track for telemetry. If ``None`` (default), returns a
+        decorator that can be applied to a function.
+    _positional_arg_offset : int
+        How many leading positional arguments to skip when assigning recorded
+        position indexes. The arguments are still tracked; only their stored
+        position (``p``) is shifted. Set this to ``1`` when decorating a method
+        (such as a class ``__init__``) so that its first real argument is
+        recorded at position ``0``, matching an equivalent plain-function
+        command.
+
+    Examples
+    --------
+    >>> @st.gather_metrics("my_command")
+    ... def my_command(url):
+    ...     return url
+    """
+
+    if not name:
+        _LOGGER.warning("gather_metrics: name is empty")
+        name = "undefined"
+
+    if func is None:
+        # Support passing the params via function decorator
+        def wrapper(f: F) -> F:
+            return gather_metrics(
+                name=name,
+                func=f,
+                _positional_arg_offset=_positional_arg_offset,
+            )
+
+        return wrapper
+    # To make mypy type narrow F | None -> F
+    non_optional_func = func
+
+    @wraps(non_optional_func)
+    def wrapped_func(*args: Any, **kwargs: Any) -> Any:
+        from timeit import default_timer as timer
 
         exec_start = timer()
-        result = callable(*args, **kwargs)
+        ctx = get_script_run_ctx(suppress_warning=True)
 
-        # Activate tracking again
-        if ctx:
-            ctx.command_tracking_deactivated = False
+        thread_state: FragmentThreadState | None = None
+        if ctx is not None and ctx.gather_usage_stats:
+            # Skip tracking rather than raise into user code when this thread
+            # has a ScriptRunContext but no ThreadState.
+            with contextlib.suppress(RuntimeError):
+                thread_state = ThreadState.get()
 
-        if not tracking_activated:
-            return result
+        # Fast path: skip building telemetry once the list is full. This check is
+        # not atomic with track_command(), which enforces the exact cap.
+        tracking_activated = (
+            ctx is not None
+            and thread_state is not None
+            and not thread_state.command_tracking_deactivated
+            and ctx.shared.tracked_commands_count < _MAX_TRACKED_COMMANDS
+        )
 
+        command_telemetry: Command | None = None
+        # Only the command that deactivated tracking may restore it, so nested
+        # commands cannot reactivate tracking for an outer command.
+        has_set_command_tracking_deactivated = False
+
+        if ctx and tracking_activated:
+            try:
+                command_telemetry = _get_command_telemetry(
+                    non_optional_func,
+                    name,
+                    *args,
+                    _positional_arg_offset=_positional_arg_offset,
+                    **kwargs,
+                )
+
+                ctx.shared.track_command(
+                    command_telemetry,
+                    max_per_command=_MAX_TRACKED_PER_COMMAND,
+                    max_total=_MAX_TRACKED_COMMANDS,
+                )
+                # Deactivate tracking to prevent calls inside already tracked commands
+                ThreadState.update(command_tracking_deactivated=True)
+                has_set_command_tracking_deactivated = True
+            except Exception as ex:
+                # Always capture all exceptions since we want to make sure that
+                # the telemetry never causes any issues.
+                _LOGGER.debug("Failed to collect command telemetry", exc_info=ex)
         try:
-            command_telemetry = _get_command_telemetry(callable, *args, **kwargs)
+            result = non_optional_func(*args, **kwargs)
+        except RerunException:
+            # Duplicated from below, because static analysis tools get confused
+            # by deferring the rethrow.
+            if tracking_activated and command_telemetry:
+                command_telemetry.time = to_microseconds(timer() - exec_start)
+            raise
+        finally:
+            if has_set_command_tracking_deactivated:
+                ThreadState.update(command_tracking_deactivated=False)
+
+        if tracking_activated and command_telemetry:
+            # Set the execution time to the measured value
             command_telemetry.time = to_microseconds(timer() - exec_start)
-            if ctx:
-                ctx.tracked_commands.append(command_telemetry)
-        except Exception as ex:
-            # Always capture all exceptions since we want to make sure that
-            # the telemetry never causes any issues.
-            LOGGER.debug("Failed to collect command telemetry", exc_info=ex)
+
         return result
 
-    with contextlib.suppress(AttributeError):
+    with contextlib.suppress(AttributeError, NameError):
         # Make this a well-behaved decorator by preserving important function
         # attributes.
-        wrap.__dict__.update(callable.__dict__)
-        wrap.__signature__ = inspect.signature(callable)  # type: ignore
-    return cast(F, wrap)
+        # NameError: Python 3.14 PEP 649 deferred annotation evaluation can raise
+        # NameError for TYPE_CHECKING-only imports in inspect.signature()
+        wrapped_func.__dict__.update(non_optional_func.__dict__)
+        wrapped_func.__signature__ = inspect.signature(non_optional_func)  # type: ignore
+    return cast("F", wrapped_func)
 
 
 def create_page_profile_message(
-    commands: List[Command],
+    commands: Sequence[Command],
     exec_time: int,
     prep_time: int,
-    uncaught_exception: Optional[str] = None,
+    uncaught_exception: str | None = None,
 ) -> ForwardMsg:
-    """Create and return an PageProfile ForwardMsg."""
-
+    """Create and return the full PageProfile ForwardMsg."""
     msg = ForwardMsg()
-    msg.page_profile.commands.extend(commands)
-    msg.page_profile.exec_time = exec_time
-    msg.page_profile.prep_time = prep_time
+    page_profile = msg.page_profile
+
+    page_profile.commands.extend(commands)
+    page_profile.exec_time = exec_time
+    page_profile.prep_time = prep_time
+
+    page_profile.headless = config.get_option("server.headless")
+
+    # Include the server mode for metrics tracking
+    if config._server_mode:
+        page_profile.server_mode = config._server_mode
+
+    agent_usage.fill_page_profile(page_profile)
 
     # Collect all config options that have been manually set
-    config_options: Set[str] = set()
+    config_options: set[str] = set()
     if config._config_options:
-        for option_name in config._config_options.keys():
+        for option_name in config._config_options:
             if not config.is_manually_set(option_name):
                 # We only care about manually defined options
                 continue
 
             config_option = config._config_options[option_name]
-            if config_option.is_default:
-                option_name = f"{option_name}:default"
-            config_options.add(option_name)
+            config_options.add(
+                f"{option_name}:default" if config_option.is_default else option_name
+            )
 
-    msg.page_profile.config.extend(config_options)
+    page_profile.config.extend(config_options)
 
     # Check the predefined set of modules for attribution
-    attributions: Set[str] = {
+    attributions: set[str] = {
         attribution
         for attribution in _ATTRIBUTIONS_TO_CHECK
         if attribution in sys.modules
     }
 
-    msg.page_profile.attributions.extend(attributions)
+    page_profile.os = str(sys.platform)
+    page_profile.timezone = str(time.tzname)
+    page_profile.attributions.extend(attributions)
 
     if uncaught_exception:
-        msg.page_profile.uncaught_exception = uncaught_exception
+        page_profile.uncaught_exception = uncaught_exception
+
+    app_dir: str | None = None
+    if ctx := get_script_run_ctx():
+        page_profile.is_fragment_run = bool(ctx.fragment_ids_this_run)
+        if ctx.main_script_path:
+            app_dir = os.path.dirname(ctx.main_script_path)
+
+    # Skill/agent detection lives in ``streamlit.web.skills`` (co-located with
+    # the installer it must stay aligned with); imported lazily to avoid a
+    # module-load dependency from runtime onto web.
+    from streamlit.web import skills
+
+    page_profile.installed_skills.extend(skills.detect_installed_skills(app_dir))
+    page_profile.installed_agents.extend(skills.detect_installed_agents())
 
     return msg
